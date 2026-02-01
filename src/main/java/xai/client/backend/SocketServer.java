@@ -7,6 +7,14 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.core.Holder;
+import net.minecraft.world.item.enchantment.Enchantment;
+import net.minecraft.world.item.enchantment.ItemEnchantments;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.client.multiplayer.PlayerInfo;
+import net.minecraft.core.registries.BuiltInRegistries;
 
 import java.io.DataOutputStream;
 import java.io.DataInputStream;
@@ -20,9 +28,53 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.StreamSupport;
 
+import java.nio.charset.StandardCharsets;
+
 public class SocketServer {
     private static final SocketServer INSTANCE = new SocketServer();
     private static final int PORT = 25566;
+
+    private static final Map<String, String> ENCHANTMENT_ABBREVIATIONS = Map.ofEntries(
+        Map.entry("protection", "PR"),
+        Map.entry("fire_protection", "FP"),
+        Map.entry("feather_falling", "FF"),
+        Map.entry("blast_protection", "BP"),
+        Map.entry("projectile_protection", "PP"),
+        Map.entry("respiration", "R"),
+        Map.entry("aqua_affinity", "AA"),
+        Map.entry("thorns", "TH"),
+        Map.entry("depth_strider", "DS"),
+        Map.entry("frost_walker", "FW"),
+        Map.entry("binding_curse", "CB"),
+        Map.entry("sharpness", "SH"),
+        Map.entry("smite", "SM"),
+        Map.entry("bane_of_arthropods", "BA"),
+        Map.entry("knockback", "KB"),
+        Map.entry("fire_aspect", "FA"),
+        Map.entry("looting", "LO"),
+        Map.entry("sweeping", "SW"),
+        Map.entry("efficiency", "EF"),
+        Map.entry("silk_touch", "ST"),
+        Map.entry("unbreaking", "UB"),
+        Map.entry("fortune", "FO"),
+        Map.entry("power", "PO"),
+        Map.entry("punch", "PU"),
+        Map.entry("flame", "FL"),
+        Map.entry("infinity", "IN"),
+        Map.entry("luck_of_the_sea", "LS"),
+        Map.entry("lure", "LU"),
+        Map.entry("loyalty", "LY"),
+        Map.entry("impaling", "IM"),
+        Map.entry("riptide", "RI"),
+        Map.entry("channeling", "CH"),
+        Map.entry("multishot", "MS"),
+        Map.entry("quick_charge", "QC"),
+        Map.entry("piercing", "PI"),
+        Map.entry("mending", "ME"),
+        Map.entry("vanishing_curse", "CV"),
+        Map.entry("soul_speed", "SS"),
+        Map.entry("swift_sneak", "SN")
+    );
 
     private final List<DataOutputStream> clients = new CopyOnWriteArrayList<>();
     private final Map<String, Boolean> moduleStates = new ConcurrentHashMap<>();
@@ -178,6 +230,7 @@ public class SocketServer {
                 // Entity List
                 for (Entity entity : allEntities) {
                     if (entity instanceof Player && entity != client.player) {
+                        Player player = (Player) entity;
                         // Interpolate Position
                         // MojMap: xo, yo, zo is prevX, prevY, prevZ
                         double x = entity.xo + (entity.getX() - entity.xo) * tickDelta;
@@ -195,6 +248,66 @@ public class SocketServer {
                         out.writeFloat(relZ);
                         out.writeFloat(entity.getBbWidth());
                         out.writeFloat(entity.getBbHeight());
+
+                        // --- NAMETAG DATA ---
+                        // Name
+                        String name = player.getName().getString();
+                        byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+                        out.writeInt(nameBytes.length);
+                        out.write(nameBytes);
+
+                        // Ping
+                        int ping = -1;
+                        if (client.getConnection() != null) {
+                            PlayerInfo info = client.getConnection().getPlayerInfo(player.getUUID());
+                            if (info != null) ping = info.getLatency();
+                        }
+                        out.writeInt(ping);
+
+                        // Health
+                        out.writeFloat(player.getHealth());
+                        out.writeFloat(player.getMaxHealth());
+                        out.writeFloat(player.getAbsorptionAmount());
+
+                        // Items
+                        // Order: Main, Off, Head, Chest, Legs, Feet
+                        ItemStack[] items = new ItemStack[] {
+                            player.getMainHandItem(),
+                            player.getOffhandItem(),
+                            player.getItemBySlot(EquipmentSlot.HEAD),
+                            player.getItemBySlot(EquipmentSlot.CHEST),
+                            player.getItemBySlot(EquipmentSlot.LEGS),
+                            player.getItemBySlot(EquipmentSlot.FEET)
+                        };
+
+                        for (ItemStack stack : items) {
+                            if (stack.isEmpty()) {
+                                out.writeInt(0); // Name length 0 -> Empty
+                            } else {
+                                String itemId = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+                                byte[] idBytes = itemId.getBytes(StandardCharsets.UTF_8);
+                                out.writeInt(idBytes.length);
+                                out.write(idBytes);
+                                out.writeInt(stack.getCount());
+
+                                // Enchantments
+                                ItemEnchantments enchants = stack.getEnchantments();
+                                var entrySet = enchants.entrySet();
+                                out.writeInt(entrySet.size());
+                                
+                                for (var entry : entrySet) {
+                                    Holder<Enchantment> holder = entry.getKey();
+                                    int level = entry.getIntValue();
+                                    String enchName = holder.unwrapKey().get().location().getPath();
+                                    String abbr = ENCHANTMENT_ABBREVIATIONS.getOrDefault(enchName, enchName.substring(0, Math.min(2, enchName.length())).toUpperCase());
+                                    
+                                    byte[] abbrBytes = abbr.getBytes(StandardCharsets.UTF_8);
+                                    out.writeInt(abbrBytes.length);
+                                    out.write(abbrBytes);
+                                    out.writeInt(level);
+                                }
+                            }
+                        }
                     }
                 }
                 out.flush();

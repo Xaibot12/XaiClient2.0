@@ -6,10 +6,25 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
+struct Enchantment {
+    std::string abbr;
+    int level;
+};
+
+struct Item {
+    std::string id;
+    int count;
+    std::vector<Enchantment> enchants;
+};
+
 struct Entity {
     int id;
     float x, y, z; // Relative to camera
     float w, h;
+    std::string name;
+    int ping;
+    float health, maxHealth, absorption;
+    std::vector<Item> items;
 };
 
 struct GameData {
@@ -101,6 +116,22 @@ public:
                 i = ntohl(i);
             };
 
+            auto readString = [&](std::string& s) {
+                int len;
+                readInt(len);
+                if (len > 0) {
+                    s.resize(len);
+                    int total = 0;
+                    while (total < len) {
+                        int r = recv(sock, &s[total], len - total, 0);
+                        if (r <= 0) break; // Should handle error
+                        total += r;
+                    }
+                } else {
+                    s = "";
+                }
+            };
+
             readFloat(data.camYaw);
             readFloat(data.camPitch);
 
@@ -116,6 +147,30 @@ public:
                 readFloat(e.z);
                 readFloat(e.w);
                 readFloat(e.h);
+
+                readString(e.name);
+                readInt(e.ping);
+                readFloat(e.health);
+                readFloat(e.maxHealth);
+                readFloat(e.absorption);
+
+                for (int j = 0; j < 6; j++) {
+                    Item item;
+                    readString(item.id);
+                    if (!item.id.empty()) {
+                        readInt(item.count);
+                        int enchCount;
+                        readInt(enchCount);
+                        for (int k = 0; k < enchCount; k++) {
+                            Enchantment ench;
+                            readString(ench.abbr);
+                            readInt(ench.level);
+                            item.enchants.push_back(ench);
+                        }
+                    }
+                    e.items.push_back(item);
+                }
+
                 data.entities.push_back(e);
             }
             hasNewData = true;

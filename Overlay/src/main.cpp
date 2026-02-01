@@ -10,6 +10,7 @@
 #include "imgui_impl_dx11.h"
 #include "network.h"
 #include "ClickGUI.h"
+#include "TextureManager.h"
 #include "modules/ESP.h"
 #include "modules/Nametags.h"
 #include "modules/Disable.h"
@@ -132,6 +133,10 @@ int main(int, char**)
         return 1;
     }
 
+    // Initialize TextureManager
+    TextureManager::Instance().Initialize(g_pd3dDevice);
+
+    // Show the window
     ShowWindow(hWnd, SW_SHOWDEFAULT);
     UpdateWindow(hWnd);
 
@@ -154,6 +159,9 @@ int main(int, char**)
 
     // Connect to Mod
     net.Connect();
+
+    // Persistent Data
+    GameData data;
 
     // Main Loop
     bool done = false;
@@ -185,17 +193,22 @@ int main(int, char**)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // Read Data
-        GameData data;
-        if (net.ReadPacket(data)) {
-            // Draw ESP
-            if (espModule->enabled) {
-                ImDrawList* draw = ImGui::GetBackgroundDrawList();
-                for (const auto& e : data.entities) {
-                    Vec2 feet = WorldToScreen(e.x, e.y, e.z, data.camYaw, data.camPitch, 70.0f, (float)screenW, (float)screenH);
-                    Vec2 head = WorldToScreen(e.x, e.y + e.h, e.z, data.camYaw, data.camPitch, 70.0f, (float)screenW, (float)screenH);
+        // Read Data (Update if available)
+        net.ReadPacket(data);
 
-                    if (feet.x > 0 && feet.x < screenW) {
+        // Render Entities
+        if (espModule->enabled || nametagsModule->enabled) {
+            ImDrawList* draw = ImGui::GetBackgroundDrawList();
+            for (const auto& e : data.entities) {
+                Vec2 feet = WorldToScreen(e.x, e.y, e.z, data.camYaw, data.camPitch, 70.0f, (float)screenW, (float)screenH);
+                Vec2 head = WorldToScreen(e.x, e.y + e.h, e.z, data.camYaw, data.camPitch, 70.0f, (float)screenW, (float)screenH);
+
+                // Simple check if entity is in front of camera and roughly on screen
+                // WorldToScreen returns -10000 if behind
+                if (feet.x > -2000 && feet.x < screenW + 2000 && feet.y > -2000 && feet.y < screenH + 2000) {
+                    
+                    // Draw ESP
+                    if (espModule->enabled) {
                         float h = feet.y - head.y;
                         float w = h * 0.5f;
                         draw->AddRect(
@@ -203,6 +216,11 @@ int main(int, char**)
                             ImVec2(head.x + w/2, feet.y), 
                             IM_COL32(espModule->color[0]*255, espModule->color[1]*255, espModule->color[2]*255, 255)
                         );
+                    }
+
+                    // Draw Nametags
+                    if (nametagsModule->enabled) {
+                        nametagsModule->Render(e, head.x, head.y);
                     }
                 }
             }
