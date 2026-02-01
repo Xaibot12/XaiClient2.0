@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <vector>
 #include <iostream>
+#include "Module.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -121,5 +122,69 @@ public:
         }
 
         return hasNewData;
+    }
+
+    bool SendState(const std::vector<Module*>& modules) {
+        if (!connected) return false;
+
+        // Simple binary protocol
+        // 1. Packet ID/Header (0xDEADBEEF)
+        int header = htonl(0xDEADBEEF);
+        if (send(sock, (char*)&header, 4, 0) == SOCKET_ERROR) return false;
+
+        // 2. Count
+        int count = htonl(modules.size());
+        if (send(sock, (char*)&count, 4, 0) == SOCKET_ERROR) return false;
+
+        for (auto mod : modules) {
+            // Name Length
+            int nameLen = htonl(mod->name.length());
+            if (send(sock, (char*)&nameLen, 4, 0) == SOCKET_ERROR) return false;
+            
+            // Name
+            if (send(sock, mod->name.c_str(), mod->name.length(), 0) == SOCKET_ERROR) return false;
+
+            // Enabled
+            char enabled = mod->enabled ? 1 : 0;
+            if (mod->name == "Disable") {
+                // If this is the Disable module, we pack the "Fully" setting into the byte
+                // 0: Disabled (not active)
+                // 1: Active (Disable requested)
+                // 2: Active + Fully (Disable + Fully requested)
+                // Actually, let's keep it simple. If it's enabled, we check the 'fully' flag.
+                // Since Module base class doesn't have 'fully', we might need to cast or send extra data.
+                // But the mod expects a generic format.
+                // Let's stick to the generic format for now.
+                // However, the user wants "Fully" to be sent.
+                // So, if "Disable" module is enabled, we need to communicate "Fully".
+                // Hack: Append "Fully" to name? No.
+                // Hack: Use the enabled byte. 1 = Enabled, 2 = Enabled + Fully.
+                // The Mod needs to interpret this.
+                // Wait, I can't cast here easily without including Disable.h which might cause circular deps or just be ugly.
+                // Let's check main.cpp logic instead. 
+                // We will handle the "Disable" packet logic inside main.cpp before sending, 
+                // OR we update Module to have a generic integer state? No.
+                // Let's use the 'enabled' byte as a bitfield for Disable module.
+                // But we need to access 'fully'. 
+                // Let's leave this standard for now and handle special Disable packet in main.cpp
+            }
+            if (send(sock, &enabled, 1, 0) == SOCKET_ERROR) return false;
+        }
+        return true;
+    }
+
+    bool SendDisable(bool fully) {
+        if (!connected) return false;
+        
+        // Custom packet for Shutdown
+        // Header: 0xBADF00D
+        int header = htonl(0xBADF00D);
+        if (send(sock, (char*)&header, 4, 0) == SOCKET_ERROR) return false;
+
+        // Payload: Fully (1 byte)
+        char f = fully ? 1 : 0;
+        if (send(sock, &f, 1, 0) == SOCKET_ERROR) return false;
+
+        return true;
     }
 };

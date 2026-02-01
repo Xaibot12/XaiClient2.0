@@ -17,6 +17,9 @@
 	"entrypoints": {
 		"main": [
 			"xai.client.Xaiclient"
+		],
+		"client": [
+			"xai.client.XaiclientClient"
 		]
 	},
 	"mixins": [

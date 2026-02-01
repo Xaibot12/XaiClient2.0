@@ -9,6 +9,10 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include "network.h"
+#include "ClickGUI.h"
+#include "modules/ESP.h"
+#include "modules/Nametags.h"
+#include "modules/Disable.h"
 
 // Link DirectX
 #pragma comment(lib, "d3d11.lib")
@@ -21,6 +25,10 @@ ID3D11DeviceContext* g_pd3dDeviceContext = NULL;
 IDXGISwapChain* g_pSwapChain = NULL;
 ID3D11RenderTargetView* g_mainRenderTargetView = NULL;
 NetworkClient net;
+ClickGUI clickGui;
+ESP* espModule = nullptr;
+Nametags* nametagsModule = nullptr;
+Disable* disableModule = nullptr;
 
 // Forward declarations
 bool CreateDeviceD3D(HWND hWnd);
@@ -93,8 +101,6 @@ Vec2 WorldToScreen(float x, float y, float z, float yaw, float pitch, float fov,
 
 // Config
 bool showMenu = true;
-bool enableEsp = true;
-float espColor[3] = { 1.0f, 0.0f, 0.0f };
 
 // Main Entry Point
 int main(int, char**)
@@ -138,6 +144,14 @@ int main(int, char**)
     ImGui_ImplWin32_Init(hWnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
+    // Initialize Modules
+    espModule = new ESP();
+    nametagsModule = new Nametags();
+    disableModule = new Disable();
+    clickGui.RegisterModule(espModule);
+    clickGui.RegisterModule(nametagsModule);
+    clickGui.RegisterModule(disableModule);
+
     // Connect to Mod
     net.Connect();
 
@@ -175,7 +189,7 @@ int main(int, char**)
         GameData data;
         if (net.ReadPacket(data)) {
             // Draw ESP
-            if (enableEsp) {
+            if (espModule->enabled) {
                 ImDrawList* draw = ImGui::GetBackgroundDrawList();
                 for (const auto& e : data.entities) {
                     Vec2 feet = WorldToScreen(e.x, e.y, e.z, data.camYaw, data.camPitch, 70.0f, (float)screenW, (float)screenH);
@@ -187,7 +201,7 @@ int main(int, char**)
                         draw->AddRect(
                             ImVec2(head.x - w/2, head.y), 
                             ImVec2(head.x + w/2, feet.y), 
-                            IM_COL32(espColor[0]*255, espColor[1]*255, espColor[2]*255, 255)
+                            IM_COL32(espModule->color[0]*255, espModule->color[1]*255, espModule->color[2]*255, 255)
                         );
                     }
                 }
@@ -196,11 +210,15 @@ int main(int, char**)
 
         // Draw Menu
         if (showMenu) {
-            ImGui::Begin("XaiClient");
-            ImGui::Text("Connected: %s", net.Connect() ? "Yes" : "No");
-            ImGui::Checkbox("Enable ESP", &enableEsp);
-            ImGui::ColorEdit3("ESP Color", espColor);
-            ImGui::End();
+            if (clickGui.Render()) {
+                if (disableModule->enabled) {
+                    // Send Disable Packet
+                    net.SendDisable(disableModule->fully);
+                    done = true; // Exit loop
+                } else {
+                    net.SendState(clickGui.modules);
+                }
+            }
         }
 
         // Rendering
