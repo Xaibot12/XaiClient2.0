@@ -1,5 +1,7 @@
 #include "ClickGUI.h"
 #include "imgui.h"
+#include <fstream>
+#include <sstream>
 
 ClickGUI::ClickGUI() {}
 
@@ -75,4 +77,61 @@ bool ClickGUI::Render() {
         ImGui::End();
     }
     return changed;
+}
+
+void ClickGUI::SaveConfig(const std::string& path) {
+    std::ofstream file(path);
+    if (!file.is_open()) return;
+
+    for (auto mod : modules) {
+        file << "[" << mod->name << "]" << std::endl;
+        mod->SaveConfig(file);
+        file << std::endl;
+    }
+    file.close();
+}
+
+void ClickGUI::LoadConfig(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) return;
+
+    std::string line;
+    std::string currentSection = "";
+    std::map<std::string, std::string> currentConfig;
+
+    auto ProcessSection = [&]() {
+        if (!currentSection.empty()) {
+            for (auto mod : modules) {
+                if (mod->name == currentSection) {
+                    mod->LoadConfig(currentConfig);
+                    break;
+                }
+            }
+        }
+        currentConfig.clear();
+    };
+
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+
+        // Trim
+        size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        size_t last = line.find_last_not_of(" \t\r\n");
+        line = line.substr(first, (last - first + 1));
+
+        if (line.front() == '[' && line.back() == ']') {
+            ProcessSection();
+            currentSection = line.substr(1, line.size() - 2);
+        } else {
+            size_t eq = line.find('=');
+            if (eq != std::string::npos) {
+                std::string key = line.substr(0, eq);
+                std::string val = line.substr(eq + 1);
+                currentConfig[key] = val;
+            }
+        }
+    }
+    ProcessSection(); // Process last section
+    file.close();
 }

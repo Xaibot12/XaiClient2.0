@@ -4,6 +4,7 @@
 #include <tchar.h>
 #include <dwmapi.h>
 #include <cmath>
+#include <string.h>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -101,7 +102,19 @@ Vec2 WorldToScreen(float x, float y, float z, float yaw, float pitch, float fov,
 }
 
 // Config
-bool showMenu = true;
+bool showMenu = false;
+
+// Window Enumeration Callback
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    char title[256];
+    if (GetWindowTextA(hwnd, title, sizeof(title))) {
+        if (strstr(title, "Minecraft") != NULL && strstr(title, "1.21.4") != NULL) {
+            *(HWND*)lParam = hwnd;
+            return FALSE; // Stop enumeration
+        }
+    }
+    return TRUE; // Continue
+}
 
 // Main Entry Point
 int main(int, char**)
@@ -113,6 +126,7 @@ int main(int, char**)
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
+    // Initial Style: Click-Through (Transparent) because showMenu is false
     HWND hWnd = CreateWindowEx(
         WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW, 
         _T("XaiOverlay"), _T("XaiOverlay"), 
@@ -139,6 +153,12 @@ int main(int, char**)
     // Show the window
     ShowWindow(hWnd, SW_SHOWDEFAULT);
     UpdateWindow(hWnd);
+    
+    // Find Minecraft Window
+    HWND mcHwnd = NULL;
+    // We'll search for it in the loop or find it once here.
+    // Finding it once is risky if MC restarts. Finding it every frame is expensive.
+    // Let's find it periodically.
 
     // Setup ImGui
     IMGUI_CHECKVERSION();
@@ -156,6 +176,9 @@ int main(int, char**)
     clickGui.RegisterModule(espModule);
     clickGui.RegisterModule(nametagsModule);
     clickGui.RegisterModule(disableModule);
+
+    // Load Config
+    clickGui.LoadConfig("config.ini");
 
     // Connect to Mod
     net.Connect();
@@ -185,9 +208,34 @@ int main(int, char**)
             } else {
                 // Click Through
                 SetWindowLong(hWnd, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW);
+                // Save Config when menu is closed
+                clickGui.SaveConfig("config.ini");
+            }
+            SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+
+        // Find Minecraft Window
+        static HWND mcHwnd = NULL;
+        static int frameCount = 0;
+        if (frameCount++ % 60 == 0 || mcHwnd == NULL) { // Check every ~1 second
+            mcHwnd = NULL;
+            EnumWindows(EnumWindowsProc, (LPARAM)&mcHwnd);
+            
+            // Try to reconnect if disconnected
+            if (!net.IsConnected()) {
+                net.Connect();
             }
         }
 
+        // Determine Focus State
+        bool isFocused = true;
+        if (mcHwnd) {
+            HWND foreground = GetForegroundWindow();
+            if (foreground != mcHwnd && foreground != hWnd) { // hWnd is our overlay
+                isFocused = false;
+            }
+        }
+        
         // Start Frame
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -196,38 +244,108 @@ int main(int, char**)
         // Read Data (Update if available)
         net.ReadPacket(data);
 
-        // Render Entities
-        if (espModule->enabled || nametagsModule->enabled) {
+        // Render Entities (Hide if not focused OR screen is open)
+        if (isFocused && !data.isScreenOpen && (espModule->enabled || nametagsModule->enabled)) {
             ImDrawList* draw = ImGui::GetBackgroundDrawList();
             for (const auto& e : data.entities) {
-                Vec2 feet = WorldToScreen(e.x, e.y, e.z, data.camYaw, data.camPitch, 70.0f, (float)screenW, (float)screenH);
-                Vec2 head = WorldToScreen(e.x, e.y + e.h, e.z, data.camYaw, data.camPitch, 70.0f, (float)screenW, (float)screenH);
+                // Calculate 3D Bounding Box Corners
+                float w2 = e.w / 2.0f;
+                float points[8][3] = {
+                    { e.x - w2, e.y,       e.z - w2 }, // 0: Bottom-Left-North
+                    { e.x + w2, e.y,       e.z - w2 }, // 1: Bottom-Right-North
+                    { e.x - w2, e.y,       e.z + w2 }, // 2: Bottom-Left-South
+                    { e.x + w2, e.y,       e.z + w2 }, // 3: Bottom-Right-South
+                    { e.x - w2, e.y + e.h, e.z - w2 }, // 4: Top-Left-North
+                    { e.x + w2, e.y + e.h, e.z - w2 }, // 5: Top-Right-North
+                    { e.x - w2, e.y + e.h, e.z + w2 }, // 6: Top-Left-South
+                    { e.x + w2, e.y + e.h, e.z + w2 }  // 7: Top-Right-South
+                };
 
-                // Simple check if entity is in front of camera and roughly on screen
-                // WorldToScreen returns -10000 if behind
-                if (feet.x > -2000 && feet.x < screenW + 2000 && feet.y > -2000 && feet.y < screenH + 2000) {
-                    
-                    // Draw ESP
-                    if (espModule->enabled) {
-                        float h = feet.y - head.y;
-                        float w = h * 0.5f;
-                        draw->AddRect(
-                            ImVec2(head.x - w/2, head.y), 
-                            ImVec2(head.x + w/2, feet.y), 
-                            IM_COL32(espModule->color[0]*255, espModule->color[1]*255, espModule->color[2]*255, 255)
-                        );
-                    }
+                // Define Faces (Vertex Indices)
+                // Order: Bottom, Top, North, South, West, East
+                int faces[6][4] = {
+                    {0, 1, 3, 2}, // Bottom
+                    {4, 5, 7, 6}, // Top
+                    {0, 4, 5, 1}, // North (Z-)
+                    {2, 6, 7, 3}, // South (Z+)
+                    {0, 2, 6, 4}, // West (X-)
+                    {1, 5, 7, 3}  // East (X+)
+                };
 
-                    // Draw Nametags
-                    if (nametagsModule->enabled) {
-                        nametagsModule->Render(e, head.x, head.y);
+                // Face Normals (X, Y, Z)
+                float normals[6][3] = {
+                    {0, -1, 0}, // Bottom
+                    {0, 1, 0},  // Top
+                    {0, 0, -1}, // North
+                    {0, 0, 1},  // South
+                    {-1, 0, 0}, // West
+                    {1, 0, 0}   // East
+                };
+
+                // Face Centers relative to camera (e.x/y/z are already relative)
+                float centers[6][3] = {
+                    {e.x, e.y, e.z},             // Bottom
+                    {e.x, e.y + e.h, e.z},       // Top
+                    {e.x, e.y + e.h/2.0f, e.z - w2}, // North
+                    {e.x, e.y + e.h/2.0f, e.z + w2}, // South
+                    {e.x - w2, e.y + e.h/2.0f, e.z}, // West
+                    {e.x + w2, e.y + e.h/2.0f, e.z}  // East
+                };
+
+                // Draw Visible Faces
+                bool anyVisible = false;
+                float minX = 100000, maxX = -100000;
+                float minY = 100000, maxY = -100000;
+                bool hasValidPoints = false; // Track if ANY point is valid for nametag culling check
+
+                for (int i = 0; i < 6; i++) {
+                    // Dot Product: ViewVector (Center - Camera) . Normal
+                    // Camera is at (0,0,0), so ViewVector is just Center
+                    float dot = centers[i][0] * normals[i][0] + 
+                                centers[i][1] * normals[i][1] + 
+                                centers[i][2] * normals[i][2];
+
+                    if (dot < 0) { // Facing Camera
+                        // Project vertices
+                        Vec2 screenPoints[4];
+                        bool allValid = true;
+                        for (int j = 0; j < 4; j++) {
+                            int idx = faces[i][j];
+                            screenPoints[j] = WorldToScreen(points[idx][0], points[idx][1], points[idx][2], data.camYaw, data.camPitch, data.fov, (float)screenW, (float)screenH);
+                            if (screenPoints[j].x <= -10000) allValid = false;
+                            
+                            // Update BBox for nametags (use any valid point we find)
+                            if (screenPoints[j].x > -10000) {
+                                hasValidPoints = true;
+                                if (screenPoints[j].x < minX) minX = screenPoints[j].x;
+                                if (screenPoints[j].x > maxX) maxX = screenPoints[j].x;
+                                if (screenPoints[j].y < minY) minY = screenPoints[j].y;
+                                if (screenPoints[j].y > maxY) maxY = screenPoints[j].y;
+                            }
+                        }
+
+                        if (allValid && espModule->enabled) {
+                            // Draw Quad Edges
+                            ImU32 col = IM_COL32(espModule->color[0]*255, espModule->color[1]*255, espModule->color[2]*255, 255);
+                            draw->AddLine(ImVec2(screenPoints[0].x, screenPoints[0].y), ImVec2(screenPoints[1].x, screenPoints[1].y), col);
+                            draw->AddLine(ImVec2(screenPoints[1].x, screenPoints[1].y), ImVec2(screenPoints[2].x, screenPoints[2].y), col);
+                            draw->AddLine(ImVec2(screenPoints[2].x, screenPoints[2].y), ImVec2(screenPoints[3].x, screenPoints[3].y), col);
+                            draw->AddLine(ImVec2(screenPoints[3].x, screenPoints[3].y), ImVec2(screenPoints[0].x, screenPoints[0].y), col);
+                            anyVisible = true;
+                        }
                     }
+                }
+
+                // Draw Nametags (Centered above box) - Check hasValidPoints instead of anyVisible to fix close-up culling
+                if (hasValidPoints && nametagsModule->enabled) {
+                    float centerX = (minX + maxX) / 2.0f;
+                    nametagsModule->Render(e, centerX, minY, data.fov);
                 }
             }
         }
 
-        // Draw Menu
-        if (showMenu) {
+        // Draw Menu (Hide if not focused)
+        if (showMenu && isFocused) {
             if (clickGui.Render()) {
                 if (disableModule->enabled) {
                     // Send Disable Packet
@@ -250,6 +368,7 @@ int main(int, char**)
     }
 
     // Cleanup
+    clickGui.SaveConfig("config.ini");
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

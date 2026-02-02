@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <map>
 #include "imgui.h"
 
 enum class CategoryType {
@@ -31,5 +32,15 @@ public:
     // Draw settings in the expanded view
     virtual void RenderSettings() {
         ImGui::Text("No settings available.");
+    }
+
+    virtual void SaveConfig(std::ostream& stream) {
+        stream << "Enabled=" << (enabled ? "1" : "0") << "\n";
+    }
+
+    virtual void LoadConfig(const std::map<std::string, std::string>& config) {
+        if (config.count("Enabled")) {
+            enabled = config.at("Enabled") == "1";
+        }
     }
 };

@@ -14,6 +14,8 @@ struct Enchantment {
 struct Item {
     std::string id;
     int count;
+    int maxDamage;
+    int damage;
     std::vector<Enchantment> enchants;
 };
 
@@ -29,6 +31,8 @@ struct Entity {
 
 struct GameData {
     float camYaw, camPitch;
+    float fov;
+    bool isScreenOpen;
     std::vector<Entity> entities;
 };
 
@@ -39,8 +43,15 @@ class NetworkClient {
 public:
     NetworkClient() : sock(INVALID_SOCKET) {}
 
+    bool IsConnected() const { return connected; }
+
     bool Connect() {
         if (connected) return true;
+
+        if (sock != INVALID_SOCKET) {
+            closesocket(sock);
+            sock = INVALID_SOCKET;
+        }
 
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return false;
@@ -94,6 +105,8 @@ public:
             int bytes = recv(sock, (char*)&header, 4, 0);
             if (bytes <= 0) {
                 connected = false;
+                closesocket(sock);
+                sock = INVALID_SOCKET;
                 return false;
             }
 
@@ -134,6 +147,11 @@ public:
 
             readFloat(data.camYaw);
             readFloat(data.camPitch);
+            readFloat(data.fov);
+
+            char screenStatus;
+            recv(sock, &screenStatus, 1, 0);
+            data.isScreenOpen = (screenStatus != 0);
 
             int count;
             readInt(count);
@@ -159,6 +177,11 @@ public:
                     readString(item.id);
                     if (!item.id.empty()) {
                         readInt(item.count);
+                        
+                        // Durability
+                        readInt(item.maxDamage);
+                        readInt(item.damage);
+
                         int enchCount;
                         readInt(enchCount);
                         for (int k = 0; k < enchCount; k++) {

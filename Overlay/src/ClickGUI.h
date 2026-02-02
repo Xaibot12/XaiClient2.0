@@ -16,4 +16,7 @@ public:
     bool Render();
     
     std::string GetCategoryName(CategoryType type);
+
+    void SaveConfig(const std::string& path);
+    void LoadConfig(const std::string& path);
 };

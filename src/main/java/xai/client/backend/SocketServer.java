@@ -15,6 +15,7 @@ import net.minecraft.world.item.enchantment.ItemEnchantments;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.client.multiplayer.PlayerInfo;
 import net.minecraft.core.registries.BuiltInRegistries;
+import java.lang.reflect.Method;
 
 import java.io.DataOutputStream;
 import java.io.DataInputStream;
@@ -80,6 +81,7 @@ public class SocketServer {
     private final Map<String, Boolean> moduleStates = new ConcurrentHashMap<>();
     private ServerSocket serverSocket;
     private boolean running = false;
+    private Method getFovMethod;
 
     public static SocketServer getInstance() {
         return INSTANCE;
@@ -207,6 +209,43 @@ public class SocketServer {
             Vec3 camPos = client.gameRenderer.getMainCamera().getPosition();
             float camYaw = client.gameRenderer.getMainCamera().getYRot();
             float camPitch = client.gameRenderer.getMainCamera().getXRot();
+            
+            if (getFovMethod == null) {
+                try {
+                    for (Method m : client.gameRenderer.getClass().getDeclaredMethods()) {
+                        if ((m.getReturnType() == double.class || m.getReturnType() == float.class) && m.getParameterCount() == 3) {
+                            Class<?>[] params = m.getParameterTypes();
+                            if (net.minecraft.client.Camera.class.isAssignableFrom(params[0]) &&
+                                params[1] == float.class &&
+                                params[2] == boolean.class) {
+                                m.setAccessible(true);
+                                getFovMethod = m;
+                                System.out.println("XaiClient: Found FOV method: " + m.getName() + " Return: " + m.getReturnType().getName());
+                                break;
+                            }
+                        }
+                    }
+                    if (getFovMethod == null) {
+                        System.out.println("XaiClient: ERROR - Could not find getFov method via reflection!");
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+
+            double fov = 70.0;
+            if (getFovMethod != null) {
+                try {
+                    Object result = getFovMethod.invoke(client.gameRenderer, client.gameRenderer.getMainCamera(), tickDelta, true);
+                    if (result instanceof Double) {
+                        fov = (double) result;
+                    } else if (result instanceof Float) {
+                        fov = (double) (float) result;
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
 
             // 1. Filter Entities
             Iterable<Entity> allEntities = client.level.entitiesForRendering();
@@ -223,6 +262,10 @@ public class SocketServer {
                 // Camera Orientation
                 out.writeFloat(camYaw);
                 out.writeFloat(camPitch);
+                out.writeFloat((float) fov);
+                
+                // Screen Status
+                out.writeBoolean(client.screen != null);
                 
                 // Entity Count
                 out.writeInt(entityCount);
@@ -289,6 +332,15 @@ public class SocketServer {
                                 out.writeInt(idBytes.length);
                                 out.write(idBytes);
                                 out.writeInt(stack.getCount());
+                                
+                                // Durability
+                                if (stack.isDamageableItem()) {
+                                    out.writeInt(stack.getMaxDamage());
+                                    out.writeInt(stack.getDamageValue());
+                                } else {
+                                    out.writeInt(0); // Max Damage
+                                    out.writeInt(0); // Damage
+                                }
 
                                 // Enchantments
                                 ItemEnchantments enchants = stack.getEnchantments();
