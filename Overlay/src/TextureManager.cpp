@@ -35,6 +35,20 @@ ID3D11ShaderResourceView* TextureManager::GetTexture(const std::string& itemId) 
     return srv;
 }
 
+ID3D11ShaderResourceView* TextureManager::GetBlockTexture(const std::string& blockId) {
+    if (blockTextureCache.find(blockId) != blockTextureCache.end()) {
+        return blockTextureCache[blockId];
+    }
+
+    std::string basePath = "C:/Users/Tobi/Documents/GitHub/XaiClient2.0.0/Overlay/assets/MinecraftTexturePack/assets/minecraft/textures/block/";
+    std::string fullPath = basePath + blockId + ".png";
+
+    ID3D11ShaderResourceView* srv = LoadTextureFromFile(fullPath);
+    blockTextureCache[blockId] = srv;
+    
+    return srv;
+}
+
 ID3D11ShaderResourceView* TextureManager::LoadTextureFromFile(const std::string& path) {
     if (!device) return nullptr;
 

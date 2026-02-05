@@ -30,52 +30,78 @@ bool ClickGUI::Render() {
 
     bool changed = false;
 
-    CategoryType categories[] = {
-        CategoryType::Combat,
-        CategoryType::Render,
-        CategoryType::Movement,
-        CategoryType::Settings
-    };
-
-    for (auto cat : categories) {
-        std::string catName = GetCategoryName(cat);
+    // Main ClickGUI Window
+    ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
+    
+    // Pass nullptr to second argument to remove close button (handled by keybind)
+    if (ImGui::Begin("XaiClient", nullptr, ImGuiWindowFlags_NoCollapse)) {
         
-        // Use ImGui::Begin to create a window for each category
-        // This makes them drag-and-droppable by default in ImGui
-        ImGui::SetNextWindowSize(ImVec2(150, 0), ImGuiCond_FirstUseEver);
-        
-        // Create the window
-        if (ImGui::Begin(catName.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (ImGui::BeginTabBar("Categories")) {
             
-            for (auto mod : modules) {
-                if (mod->category == cat) {
-                    // Render Module as a Selectable (like a list item)
-                    // It highlights when 'enabled' is true
-                    if (ImGui::Selectable(mod->name.c_str(), mod->enabled)) {
-                        mod->Toggle();
-                        changed = true;
+            CategoryType categories[] = {
+                CategoryType::Combat,
+                CategoryType::Render,
+                CategoryType::Movement,
+                CategoryType::Settings
+            };
+
+            for (auto cat : categories) {
+                if (ImGui::BeginTabItem(GetCategoryName(cat).c_str())) {
+                    
+                    ImGui::Spacing();
+                    
+                    // Filter modules for this category
+                    for (auto mod : modules) {
+                        if (mod->category == cat) {
+                            ImGui::PushID(mod->name.c_str()); // Unique ID scope
+
+                            // Render Module Checkbox
+                            bool enabled = mod->enabled;
+                            if (ImGui::Checkbox(mod->name.c_str(), &enabled)) {
+                                mod->Toggle();
+                                changed = true;
+                            }
+                            
+                            ImGui::SameLine();
+                            // Use ArrowButton for settings
+                            if (ImGui::ArrowButton("##settings", mod->expanded ? ImGuiDir_Down : ImGuiDir_Right)) {
+                                mod->expanded = !mod->expanded;
+                            }
+
+                            if (mod->expanded) {
+                                ImGui::Indent();
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+                                mod->RenderSettings();
+                                ImGui::PopStyleColor();
+                                ImGui::Unindent();
+                                ImGui::Separator();
+                            }
+                            
+                            ImGui::PopID();
+                        }
                     }
                     
-                    // Right click to expand/collapse settings
-                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-                        mod->expanded = !mod->expanded;
-                    }
-
-                    // Render Settings if expanded
-                    if (mod->expanded) {
-                        ImGui::Indent();
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
-                        mod->RenderSettings();
-                        ImGui::PopStyleColor();
-                        ImGui::Unindent();
-                        // Add a small separator after settings for visual clarity
+                    // Settings Category Extras
+                    if (cat == CategoryType::Settings) {
                         ImGui::Separator();
+                        ImGui::TextDisabled("Configuration");
+                        if (ImGui::Button("Save Config", ImVec2(120, 0))) {
+                            SaveConfig("config.ini");
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Load Config", ImVec2(120, 0))) {
+                            LoadConfig("config.ini");
+                        }
                     }
+                    
+                    ImGui::EndTabItem();
                 }
             }
+            ImGui::EndTabBar();
         }
-        ImGui::End();
     }
+    ImGui::End();
+
     return changed;
 }
 

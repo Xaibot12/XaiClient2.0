@@ -1,7 +1,10 @@
 #pragma once
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <winsock2.h>
 #include <vector>
 #include <iostream>
+#include <algorithm>
+#include <intrin.h>
 #include "Module.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -29,11 +32,26 @@ struct Entity {
     std::vector<Item> items;
 };
 
+struct BlockPos {
+    std::string id;
+    int x, y, z; // Absolute Coordinates
+};
+
+struct BlockUpdate {
+    bool remove;
+    std::string id;
+    int x, y, z;
+};
+
 struct GameData {
     float camYaw, camPitch;
+    double camX, camY, camZ; // Absolute Camera Position
     float fov;
     bool isScreenOpen;
+    bool shouldClearBlocks = false;
     std::vector<Entity> entities;
+    std::vector<BlockUpdate> blockUpdates;
+    std::vector<std::string> blocksToDelete;
 };
 
 class NetworkClient {
@@ -73,6 +91,7 @@ public:
 
         if (connect(sock, (sockaddr*)&server, sizeof(server)) == 0) {
             connected = true;
+            // Clear previous state on new connection
             return true;
         }
 
@@ -81,29 +100,74 @@ public:
         return false;
     }
 
+    bool SendDisable(bool fully) {
+        if (!connected) return false;
+
+        int header = htonl(0xBADF00D);
+        if (send(sock, (char*)&header, 4, 0) == SOCKET_ERROR) return false;
+
+        char b = fully ? 1 : 0;
+        if (send(sock, &b, 1, 0) == SOCKET_ERROR) return false;
+        
+        return true;
+    }
+
+    bool SendState(const std::vector<Module*>& modules) {
+        if (!connected) return false;
+
+        int header = htonl(0xDEADBEEF);
+        if (send(sock, (char*)&header, 4, 0) == SOCKET_ERROR) return false;
+
+        int count = htonl(modules.size());
+        if (send(sock, (char*)&count, 4, 0) == SOCKET_ERROR) return false;
+
+        for (Module* mod : modules) {
+            std::string name = mod->name;
+            int nameLen = htonl(name.length());
+            if (send(sock, (char*)&nameLen, 4, 0) == SOCKET_ERROR) return false;
+            if (send(sock, name.c_str(), name.length(), 0) == SOCKET_ERROR) return false;
+            
+            char enabled = mod->enabled ? 1 : 0;
+            if (send(sock, &enabled, 1, 0) == SOCKET_ERROR) return false;
+        }
+        return true;
+    }
+
+    bool SendBlockList(const std::vector<std::string>& blocks) {
+        if (!connected) return false;
+        std::cout << "[Overlay] Sending Block List Request. Count: " << blocks.size() << std::endl;
+        // Packet Header: 0xB10C0
+        int header = htonl(0xB10C0);
+        if (send(sock, (char*)&header, 4, 0) == SOCKET_ERROR) return false;
+
+        int count = htonl(blocks.size());
+        if (send(sock, (char*)&count, 4, 0) == SOCKET_ERROR) return false;
+
+        for (const auto& block : blocks) {
+            int len = htonl(block.length());
+            if (send(sock, (char*)&len, 4, 0) == SOCKET_ERROR) return false;
+            if (send(sock, block.c_str(), block.length(), 0) == SOCKET_ERROR) return false;
+        }
+        return true;
+    }
+
     bool ReadPacket(GameData& data) {
         if (!connected) return false;
 
-        // Drain the buffer: Read ALL available packets, keep only the last full one.
-        // This prevents latency buildup if the game renders faster than the overlay.
-        bool hasNewData = false;
-        
+        bool gotFrameUpdate = false;
+
+        // Loop to process all pending packets
         while (true) {
-            // Check if data is available without blocking
             unsigned long bytesAvailable = 0;
             ioctlsocket(sock, FIONREAD, &bytesAvailable);
             
-            // If no data available, but we haven't read anything yet, block for one packet
-            if (bytesAvailable == 0 && !hasNewData) {
-                 // Wait for at least one packet
-            } else if (bytesAvailable == 0) {
-                // We have the latest packet
-                break;
-            }
+            // If no data and we haven't updated yet, wait a bit? 
+            // No, ReadPacket is called per frame. We check what's there.
+            if (bytesAvailable < 4) break;
 
             int header;
-            int bytes = recv(sock, (char*)&header, 4, 0);
-            if (bytes <= 0) {
+            int r = recv(sock, (char*)&header, 4, 0);
+            if (r <= 0) {
                 connected = false;
                 closesocket(sock);
                 sock = INVALID_SOCKET;
@@ -111,158 +175,178 @@ public:
             }
 
             header = ntohl(header);
-            if (header != 0xCAFEBABE) {
-                // Desync!
-                return false; 
-            }
 
-            // Read the rest of the packet
+            // Helpers with error checking
+            bool readError = false;
             auto readFloat = [&](float& f) {
-                int i;
-                recv(sock, (char*)&i, 4, 0);
-                i = ntohl(i);
-                memcpy(&f, &i, 4);
+                if (readError) return;
+                int i; 
+                int rr = recv(sock, (char*)&i, 4, 0);
+                if (rr != 4) { readError = true; return; }
+                i = ntohl(i); memcpy(&f, &i, 4);
             };
-            
+            auto readDouble = [&](double& d) {
+                if (readError) return;
+                long long l; 
+                int rr = recv(sock, (char*)&l, 8, 0);
+                if (rr != 8) { readError = true; return; }
+                l = _byteswap_uint64(l);
+                memcpy(&d, &l, 8);
+            };
             auto readInt = [&](int& i) {
-                recv(sock, (char*)&i, 4, 0);
+                if (readError) return;
+                int rr = recv(sock, (char*)&i, 4, 0);
+                if (rr != 4) { readError = true; return; }
                 i = ntohl(i);
             };
-
+            auto readByte = [&](char& b) {
+                if (readError) return;
+                int rr = recv(sock, &b, 1, 0);
+                if (rr != 1) { readError = true; return; }
+            };
             auto readString = [&](std::string& s) {
-                int len;
-                readInt(len);
+                if (readError) return;
+                int len; readInt(len);
+                if (readError) return;
+                
+                if (len > 32767 || len < 0) { // Sanity check
+                    std::cout << "[Network] Error: String length " << len << " out of bounds." << std::endl;
+                    readError = true;
+                    return;
+                }
+
                 if (len > 0) {
                     s.resize(len);
                     int total = 0;
                     while (total < len) {
-                        int r = recv(sock, &s[total], len - total, 0);
-                        if (r <= 0) break; // Should handle error
-                        total += r;
+                        int rr = recv(sock, &s[total], len - total, 0);
+                        if (rr <= 0) { readError = true; break; }
+                        total += rr;
                     }
-                } else {
-                    s = "";
-                }
+                } else s = "";
             };
 
-            readFloat(data.camYaw);
-            readFloat(data.camPitch);
-            readFloat(data.fov);
+            if (header == 0xCAFEBABE) { // Frame Data
+                readFloat(data.camYaw);
+                readFloat(data.camPitch);
+                readDouble(data.camX);
+                readDouble(data.camY);
+                readDouble(data.camZ);
+                readFloat(data.fov);
 
-            char screenStatus;
-            recv(sock, &screenStatus, 1, 0);
-            data.isScreenOpen = (screenStatus != 0);
+                char screenStatus;
+                readByte(screenStatus);
+                data.isScreenOpen = (screenStatus != 0);
 
-            int count;
-            readInt(count);
-
-            data.entities.clear();
-            for (int i = 0; i < count; i++) {
-                Entity e;
-                readInt(e.id);
-                readFloat(e.x);
-                readFloat(e.y);
-                readFloat(e.z);
-                readFloat(e.w);
-                readFloat(e.h);
-
-                readString(e.name);
-                readInt(e.ping);
-                readFloat(e.health);
-                readFloat(e.maxHealth);
-                readFloat(e.absorption);
-
-                for (int j = 0; j < 6; j++) {
-                    Item item;
-                    readString(item.id);
-                    if (!item.id.empty()) {
-                        readInt(item.count);
-                        
-                        // Durability
-                        readInt(item.maxDamage);
-                        readInt(item.damage);
-
-                        int enchCount;
-                        readInt(enchCount);
-                        for (int k = 0; k < enchCount; k++) {
-                            Enchantment ench;
-                            readString(ench.abbr);
-                            readInt(ench.level);
-                            item.enchants.push_back(ench);
-                        }
-                    }
-                    e.items.push_back(item);
+                int count;
+                readInt(count);
+                if (!readError && (count < 0 || count > 100000)) { // Sanity
+                    std::cout << "[Network] Error: Entity count " << count << " unreasonable." << std::endl;
+                    readError = true; 
                 }
 
-                data.entities.push_back(e);
+                if (!readError) {
+                    data.entities.clear();
+                    for (int i = 0; i < count; i++) {
+                        if (readError) break;
+                        Entity e;
+                        readInt(e.id);
+                        readFloat(e.x);
+                        readFloat(e.y);
+                        readFloat(e.z);
+                        readFloat(e.w);
+                        readFloat(e.h);
+
+                        readString(e.name);
+                        readInt(e.ping);
+                        readFloat(e.health);
+                        readFloat(e.maxHealth);
+                        readFloat(e.absorption);
+
+                        for (int j = 0; j < 6; j++) {
+                            if (readError) break;
+                            Item item;
+                            readString(item.id);
+                            if (!readError && !item.id.empty()) {
+                                readInt(item.count);
+                                readInt(item.maxDamage);
+                                readInt(item.damage);
+                                int enchCount;
+                                readInt(enchCount);
+                                if (!readError && (enchCount < 0 || enchCount > 100)) { readError = true; } // Sanity
+                                
+                                for (int k = 0; k < enchCount; k++) {
+                                    if (readError) break;
+                                    Enchantment ench;
+                                    readString(ench.abbr);
+                                    readInt(ench.level);
+                                    item.enchants.push_back(ench);
+                                }
+                            }
+                        }
+                        data.entities.push_back(e);
+                    }
+                }
+                
+                if (!readError) gotFrameUpdate = true;
+
+                } 
+                else if (header == 0xBE0C4D0) { // Block Updates
+                    int count;
+                    readInt(count);
+                    
+                    if (!readError && (count < 0 || count > 1000000)) { // Sanity (up to 1M updates is theoretically possible but risky, let's say 100k)
+                         std::cout << "[Network] Error: Block update count " << count << " unreasonable." << std::endl;
+                         readError = true;
+                    }
+
+                    if (!readError) {
+                        for(int i=0; i<count; i++) {
+                            if (readError) break;
+                            char type;
+                            readByte(type);
+                            int x, y, z;
+                            readInt(x); readInt(y); readInt(z);
+                            
+                            BlockUpdate bu;
+                            bu.x = x; bu.y = y; bu.z = z;
+                            if (type == 0) { // Add
+                                bu.remove = false;
+                                readString(bu.id);
+                            } else { // Remove
+                                bu.remove = true;
+                            }
+                            data.blockUpdates.push_back(bu);
+                        }
+                    }
+                }
+                else if (header == 0x0C1EA400) { // CLEAR ALL
+                    data.shouldClearBlocks = true;
+                }
+                else if (header == 0xB10CDE1) { // Delete Block Type
+                    std::string blockId;
+                    readString(blockId);
+                    if (!readError) {
+                        data.blocksToDelete.push_back(blockId);
+                    }
+                }
+                else {
+                    // Desync
+                    std::cout << "[Network] Error: Unknown Packet Header 0x" << std::hex << header << std::dec << std::endl;
+                    connected = false;
+                    closesocket(sock);
+                    sock = INVALID_SOCKET;
+                    return false;
+                }
+
+                if (readError) {
+                    std::cout << "[Network] Error: Read failure during packet body." << std::endl;
+                    connected = false;
+                    closesocket(sock);
+                    sock = INVALID_SOCKET;
+                    return false;
+                }
             }
-            hasNewData = true;
+            return gotFrameUpdate;
         }
-
-        return hasNewData;
-    }
-
-    bool SendState(const std::vector<Module*>& modules) {
-        if (!connected) return false;
-
-        // Simple binary protocol
-        // 1. Packet ID/Header (0xDEADBEEF)
-        int header = htonl(0xDEADBEEF);
-        if (send(sock, (char*)&header, 4, 0) == SOCKET_ERROR) return false;
-
-        // 2. Count
-        int count = htonl(modules.size());
-        if (send(sock, (char*)&count, 4, 0) == SOCKET_ERROR) return false;
-
-        for (auto mod : modules) {
-            // Name Length
-            int nameLen = htonl(mod->name.length());
-            if (send(sock, (char*)&nameLen, 4, 0) == SOCKET_ERROR) return false;
-            
-            // Name
-            if (send(sock, mod->name.c_str(), mod->name.length(), 0) == SOCKET_ERROR) return false;
-
-            // Enabled
-            char enabled = mod->enabled ? 1 : 0;
-            if (mod->name == "Disable") {
-                // If this is the Disable module, we pack the "Fully" setting into the byte
-                // 0: Disabled (not active)
-                // 1: Active (Disable requested)
-                // 2: Active + Fully (Disable + Fully requested)
-                // Actually, let's keep it simple. If it's enabled, we check the 'fully' flag.
-                // Since Module base class doesn't have 'fully', we might need to cast or send extra data.
-                // But the mod expects a generic format.
-                // Let's stick to the generic format for now.
-                // However, the user wants "Fully" to be sent.
-                // So, if "Disable" module is enabled, we need to communicate "Fully".
-                // Hack: Append "Fully" to name? No.
-                // Hack: Use the enabled byte. 1 = Enabled, 2 = Enabled + Fully.
-                // The Mod needs to interpret this.
-                // Wait, I can't cast here easily without including Disable.h which might cause circular deps or just be ugly.
-                // Let's check main.cpp logic instead. 
-                // We will handle the "Disable" packet logic inside main.cpp before sending, 
-                // OR we update Module to have a generic integer state? No.
-                // Let's use the 'enabled' byte as a bitfield for Disable module.
-                // But we need to access 'fully'. 
-                // Let's leave this standard for now and handle special Disable packet in main.cpp
-            }
-            if (send(sock, &enabled, 1, 0) == SOCKET_ERROR) return false;
-        }
-        return true;
-    }
-
-    bool SendDisable(bool fully) {
-        if (!connected) return false;
-        
-        // Custom packet for Shutdown
-        // Header: 0xBADF00D
-        int header = htonl(0xBADF00D);
-        if (send(sock, (char*)&header, 4, 0) == SOCKET_ERROR) return false;
-
-        // Payload: Fully (1 byte)
-        char f = fully ? 1 : 0;
-        if (send(sock, &f, 1, 0) == SOCKET_ERROR) return false;
-
-        return true;
-    }
 };

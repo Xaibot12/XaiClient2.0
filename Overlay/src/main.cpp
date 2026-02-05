@@ -15,6 +15,8 @@
 #include "modules/ESP.h"
 #include "modules/Nametags.h"
 #include "modules/Disable.h"
+#include "modules/BlockESP.cpp"
+#include "MathUtils.h"
 
 // Link DirectX
 #pragma comment(lib, "d3d11.lib")
@@ -31,6 +33,7 @@ ClickGUI clickGui;
 ESP* espModule = nullptr;
 Nametags* nametagsModule = nullptr;
 Disable* disableModule = nullptr;
+BlockESP* blockEspModule = nullptr;
 
 // Forward declarations
 bool CreateDeviceD3D(HWND hWnd);
@@ -39,67 +42,7 @@ void CreateRenderTarget();
 void CleanupRenderTarget();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-// Math Helpers
-struct Vec2 { float x, y; };
-
-Vec2 WorldToScreen(float x, float y, float z, float yaw, float pitch, float fov, float screenW, float screenH) {
-    // Convert degrees to radians
-    // Negate yaw/pitch to correct Minecraft vs Math coordinate differences
-    float yawRad = -yaw * (3.14159f / 180.0f);
-    float pitchRad = -pitch * (3.14159f / 180.0f);
-    float fovRad = fov * (3.14159f / 180.0f);
-
-    // Minecraft Coordinate System to Camera Space
-    // X: Right, Y: Up, Z: Back (OpenGL standard view space)
-    
-    // Rotate around Y (Yaw)
-    // We need to transform World(Relative) -> View
-    
-    // Standard rotation formulas
-    // Removed + PI offset to fix 180 degree inversion
-    float cosYaw = cos(yawRad); 
-    float sinYaw = sin(yawRad);
-    float cosPitch = cos(pitchRad);
-    float sinPitch = sin(pitchRad);
-
-    // Apply Yaw Rotation (around Y axis)
-    // x' = x*cos - z*sin
-    // z' = x*sin + z*cos
-    // We negate x1 to fix Left-Right inversion
-    float x1 = -(x * cosYaw - z * sinYaw);
-    float z1 = x * sinYaw + z * cosYaw;
-    float y1 = y;
-
-    // Apply Pitch Rotation (around X axis)
-    // y' = y*cos - z*sin
-    // z' = y*sin + z*cos
-    float y2 = y1 * cosPitch - z1 * sinPitch;
-    float z2 = y1 * sinPitch + z1 * cosPitch;
-    float x2 = x1;
-
-    // Now (x2, y2, z2) is in View Space where -Z is forward? 
-    // Wait, let's stick to a simpler projection.
-    // If z2 > 0, point is behind camera (OpenGL convention: -Z is forward)
-    // Let's assume standard perspective projection:
-    
-    // In our relative system, if z2 is POSITIVE, it's BEHIND us (since we rotated world to align with camera).
-    // Actually, let's just use the direct projection logic that works for Minecraft.
-    
-    // Project to Screen
-    // ScreenX = (x / z) * scale + center
-    // ScreenY = (y / z) * scale + center
-    
-    // Z-Check (Clipping)
-    if (z2 <= 0.1f) return { -10000, -10000 }; // Behind camera
-
-    float aspectRatio = screenW / screenH;
-    float tanHalfFov = tan(fovRad / 2.0f);
-    
-    float x_screen = (x2 / (z2 * tanHalfFov * aspectRatio)) * 0.5f + 0.5f;
-    float y_screen = 0.5f - (y2 / (z2 * tanHalfFov)) * 0.5f;
-
-    return { x_screen * screenW, y_screen * screenH };
-}
+// Math Helpers are now in MathUtils.h
 
 // Config
 bool showMenu = false;
@@ -135,7 +78,7 @@ int main(int, char**)
     );
 
     // Initialize Transparency
-    SetLayeredWindowAttributes(hWnd, RGB(0,0,0), 0, LWA_COLORKEY);
+    SetLayeredWindowAttributes(hWnd, 0, 255, LWA_ALPHA);
     MARGINS margins = { -1 };
     DwmExtendFrameIntoClientArea(hWnd, &margins);
 
@@ -173,15 +116,28 @@ int main(int, char**)
     espModule = new ESP();
     nametagsModule = new Nametags();
     disableModule = new Disable();
+    blockEspModule = new BlockESP(&net);
+
     clickGui.RegisterModule(espModule);
     clickGui.RegisterModule(nametagsModule);
     clickGui.RegisterModule(disableModule);
+    clickGui.RegisterModule(blockEspModule);
+
+    // Connect to Mod
+    if (net.Connect()) {
+        // Initial state sync
+        // Load config first, but we need connection to send update
+        // So we load config, then send update
+    }
 
     // Load Config
     clickGui.LoadConfig("config.ini");
-
-    // Connect to Mod
-    net.Connect();
+    
+    // Now that config is loaded (and BlockESP has its list), send the update if connected
+    if (net.IsConnected()) {
+        net.SendState(clickGui.modules);
+        blockEspModule->SendUpdate(); // This triggers the block list packet
+    }
 
     // Persistent Data
     GameData data;
@@ -223,7 +179,11 @@ int main(int, char**)
             
             // Try to reconnect if disconnected
             if (!net.IsConnected()) {
-                net.Connect();
+                if (net.Connect()) {
+                    // Re-sync state on reconnect
+                    net.SendState(clickGui.modules);
+                    blockEspModule->SendUpdate();
+                }
             }
         }
 
@@ -244,9 +204,21 @@ int main(int, char**)
         // Read Data (Update if available)
         net.ReadPacket(data);
 
+        ImDrawList* bgDrawList = ImGui::GetBackgroundDrawList();
+
+        // Render Blocks
+        if (isFocused && !data.isScreenOpen && blockEspModule->enabled) {
+            blockEspModule->Render(data, (float)screenW, (float)screenH, bgDrawList);
+        }
+
+        // Clear processed block updates to prevent accumulation
+        data.blockUpdates.clear();
+        data.blocksToDelete.clear();
+        data.shouldClearBlocks = false;
+
         // Render Entities (Hide if not focused OR screen is open)
         if (isFocused && !data.isScreenOpen && (espModule->enabled || nametagsModule->enabled)) {
-            ImDrawList* draw = ImGui::GetBackgroundDrawList();
+            ImDrawList* draw = bgDrawList;
             for (const auto& e : data.entities) {
                 // Calculate 3D Bounding Box Corners
                 float w2 = e.w / 2.0f;
