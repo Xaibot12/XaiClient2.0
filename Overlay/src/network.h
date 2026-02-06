@@ -52,6 +52,7 @@ struct GameData {
     std::vector<Entity> entities;
     std::vector<BlockUpdate> blockUpdates;
     std::vector<std::string> blocksToDelete;
+    std::vector<std::pair<int, int>> chunksToUnload;
 };
 
 class NetworkClient {
@@ -328,6 +329,14 @@ public:
                     readString(blockId);
                     if (!readError) {
                         data.blocksToDelete.push_back(blockId);
+                    }
+                }
+                else if (header == 0xC400000) { // Chunk Unload
+                    int cx, cz;
+                    readInt(cx);
+                    readInt(cz);
+                    if (!readError) {
+                        data.chunksToUnload.push_back({cx, cz});
                     }
                 }
                 else {

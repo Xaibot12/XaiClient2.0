@@ -2,6 +2,7 @@
 #include "imgui.h"
 #include <fstream>
 #include <sstream>
+#include <Windows.h>
 
 ClickGUI::ClickGUI() {}
 
@@ -66,6 +67,44 @@ bool ClickGUI::Render() {
                             // Use ArrowButton for settings
                             if (ImGui::ArrowButton("##settings", mod->expanded ? ImGuiDir_Down : ImGuiDir_Right)) {
                                 mod->expanded = !mod->expanded;
+                            }
+                            
+                            ImGui::SameLine();
+                            
+                            // Bind Button
+                            std::string bindText = "Bind";
+                            if (mod->isBinding) {
+                                bindText = "...";
+                            } else if (mod->keybind > 0) {
+                                char nameBuffer[128];
+                                UINT scanCode = MapVirtualKey(mod->keybind, MAPVK_VK_TO_VSC);
+                                if (GetKeyNameTextA(scanCode << 16, nameBuffer, 128)) {
+                                    bindText = std::string(nameBuffer);
+                                } else {
+                                    bindText = "Key " + std::to_string(mod->keybind);
+                                }
+                            }
+                            
+                            if (ImGui::Button(bindText.c_str())) {
+                                mod->isBinding = !mod->isBinding;
+                            }
+                            
+                            if (mod->isBinding) {
+                                ImGui::Text("Press any key (Esc to clear)");
+                                for (int i = 0x01; i < 0xFE; i++) {
+                                    if (i == VK_LBUTTON || i == VK_RBUTTON || i == VK_MBUTTON) continue; // Ignore mouse clicks for safety
+                                    
+                                    if (GetAsyncKeyState(i) & 0x8000) {
+                                        if (i == VK_ESCAPE) {
+                                            mod->keybind = 0;
+                                            mod->isBinding = false;
+                                        } else {
+                                            mod->keybind = i;
+                                            mod->isBinding = false;
+                                        }
+                                        break; // Only handle one key
+                                    }
+                                }
                             }
 
                             if (mod->expanded) {

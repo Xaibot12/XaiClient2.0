@@ -170,6 +170,15 @@ int main(int, char**)
             SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
 
+        // Module Keybinds
+        for (auto mod : clickGui.modules) {
+            if (mod->keybind > 0 && !mod->isBinding) {
+                if (GetAsyncKeyState(mod->keybind) & 1) {
+                    mod->Toggle();
+                }
+            }
+        }
+
         // Find Minecraft Window
         static HWND mcHwnd = NULL;
         static int frameCount = 0;
@@ -214,6 +223,7 @@ int main(int, char**)
         // Clear processed block updates to prevent accumulation
         data.blockUpdates.clear();
         data.blocksToDelete.clear();
+        data.chunksToUnload.clear();
         data.shouldClearBlocks = false;
 
         // Render Entities (Hide if not focused OR screen is open)

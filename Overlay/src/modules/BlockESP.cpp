@@ -114,8 +114,16 @@ bool GetAverageColor(const std::string& path, float* color) {
 
 BlockESP::BlockESP(NetworkClient* netInstance) : Module("BlockESP", CategoryType::Render), net(netInstance) {
     LoadAvailableBlocks();
+    workerThread = std::thread(&BlockESP::WorkerLoop, this);
 }
 
+BlockESP::~BlockESP() {
+    shouldStop = true;
+    queueCV.notify_all();
+    if (workerThread.joinable()) {
+        workerThread.join();
+    }
+}
 
 // Helper to strip suffixes
 std::string StripSuffix(std::string name) {
@@ -181,7 +189,10 @@ void BlockESP::RenderSettings() {
     ImGui::InputText("Search", searchFilter, IM_ARRAYSIZE(searchFilter));
     
     if (ImGui::Button("Clear Cache")) {
-        chunkMap.clear();
+        {
+            std::unique_lock<std::shared_mutex> lock(chunkMapMutex);
+            chunkMap.clear();
+        }
         SendUpdate();
     }
 
@@ -286,14 +297,22 @@ void BlockESP::RenderSettings() {
 
 void BlockESP::OnToggle() {
     // Reset local data and force resync from server
-    chunkMap.clear(); 
+    {
+        std::unique_lock<std::shared_mutex> lock(chunkMapMutex);
+        chunkMap.clear();
+    }
     SendUpdate();
 }
 
 void BlockESP::RemoveBlocks(const std::string& blockId) {
-    if (globalPaletteMap.find(blockId) == globalPaletteMap.end()) return;
-    uint16_t id = globalPaletteMap[blockId];
+    uint16_t id = 0;
+    {
+        std::lock_guard<std::mutex> lock(paletteMutex);
+        if (globalPaletteMap.find(blockId) == globalPaletteMap.end()) return;
+        id = globalPaletteMap[blockId];
+    }
 
+    std::unique_lock<std::shared_mutex> lock(chunkMapMutex);
     for (auto& [key, chunk] : chunkMap) {
         auto it = chunk.blocks.begin();
         while (it != chunk.blocks.end()) {
@@ -308,6 +327,7 @@ void BlockESP::RemoveBlocks(const std::string& blockId) {
 
 uint16_t BlockESP::GetBlockID(const std::string& name) {
     if (name.empty()) return 0;
+    std::lock_guard<std::mutex> lock(paletteMutex);
     if (globalPaletteMap.find(name) == globalPaletteMap.end()) {
         // Add to palette
         globalPalette.push_back(name);
@@ -320,12 +340,15 @@ uint16_t BlockESP::GetBlockID(const std::string& name) {
 }
 
 std::string BlockESP::GetBlockName(uint16_t id) {
+    std::lock_guard<std::mutex> lock(paletteMutex);
     if (id == 0 || id > globalPalette.size()) return "";
     return globalPalette[id - 1];
 }
 
 uint16_t BlockESP::GetBlock(int x, int y, int z) {
     auto chunkPos = GetChunkPos(x, y, z);
+    
+    // NOTE: Caller must hold chunkMapMutex (Shared or Unique)
     if (chunkMap.find(chunkPos) == chunkMap.end()) return 0;
     
     // Local coords (0-15)
@@ -335,7 +358,12 @@ uint16_t BlockESP::GetBlock(int x, int y, int z) {
     
     int index = lx + (ly * 16) + (lz * 256);
     
-    auto& blocks = chunkMap[chunkPos].blocks;
+    const auto& chunk = chunkMap.at(chunkPos);
+    
+    // Protect block access
+    std::lock_guard<std::mutex> lock(chunk.blockMutex);
+    const auto& blocks = chunk.blocks;
+    
     auto it = blocks.find(index);
     if (it != blocks.end()) {
         return it->second;
@@ -344,6 +372,20 @@ uint16_t BlockESP::GetBlock(int x, int y, int z) {
 }
 
 void BlockESP::RebuildAllChunks() {
+    // This is called from GUI thread (RenderSettings) when toggling/coloring.
+    // It should trigger rebuilds.
+    // Since we are now async, we should probably just mark all chunks dirty or push a special update?
+    // But RebuildAllChunks was synchronous.
+    // Let's make it trigger async rebuild by pushing an empty update? No.
+    // We can just iterate and call UpdateChunk, but UpdateChunk is now thread-safe (mostly).
+    // However, UpdateChunk builds mesh.
+    // If we call it here, we block the GUI.
+    // Better: Iterate all keys and add them to a "Force Rebuild" list?
+    // Or just run it synchronously here? It might freeze the UI for a moment.
+    // Given the user wants smoothness, we should probably offload this too.
+    // But for now, to keep it simple and safe, let's just lock and run it (as it was before, essentially).
+    
+    std::shared_lock<std::shared_mutex> lock(chunkMapMutex);
     for (auto& [key, chunk] : chunkMap) {
         UpdateChunk(key);
     }
@@ -416,7 +458,10 @@ void BlockESP::LoadConfig(const std::map<std::string, std::string>& config) {
         }
     }
     // Update server after loading
-    chunkMap.clear();
+    {
+        std::unique_lock<std::shared_mutex> lock(chunkMapMutex);
+        chunkMap.clear();
+    }
     SendUpdate();
 }
 
@@ -438,47 +483,94 @@ void BlockESP::ProcessUpdates(const std::vector<BlockUpdate>& updates, long long
 
     std::set<std::tuple<int, int, int>> dirtyChunks;
 
+    // Phase 1: Update Blocks
+    // Optimization: Avoid holding Unique Lock for the entire duration.
+    // Only hold Unique Lock when CREATING chunks.
+    // Use Shared Lock + Per-Chunk Lock when UPDATING blocks.
+    
+    // 1. Identify chunks that need to be created
+    std::set<std::tuple<int, int, int>> neededChunks;
     for (const auto& u : updates) {
-        auto chunkPos = GetChunkPos(u.x, u.y, u.z);
-        
-        // Local coords
-        int lx = u.x % 16; if (lx < 0) lx += 16;
-        int ly = u.y % 16; if (ly < 0) ly += 16;
-        int lz = u.z % 16; if (lz < 0) lz += 16;
-        int index = lx + (ly * 16) + (lz * 256);
+        if (!u.remove) { // We only create chunks if we are adding blocks
+            neededChunks.insert(GetChunkPos(u.x, u.y, u.z));
+        }
+    }
 
-        if (u.remove) {
-            if (chunkMap.count(chunkPos)) {
-                chunkMap[chunkPos].blocks.erase(index);
-                // If chunk is empty, we could remove it, but maybe keep it for now
-                if (chunkMap[chunkPos].blocks.empty()) {
-                    chunkMap.erase(chunkPos);
+    {
+        // Check for missing chunks with Shared Lock first
+        std::vector<std::tuple<int, int, int>> missing;
+        {
+            std::shared_lock<std::shared_mutex> lock(chunkMapMutex);
+            for(const auto& pos : neededChunks) {
+                if (chunkMap.find(pos) == chunkMap.end()) {
+                    missing.push_back(pos);
                 }
             }
-        } else {
-            // Convert string to ID
-            chunkMap[chunkPos].blocks[index] = GetBlockID(u.id);
         }
+        
+        // Create missing chunks (Unique Lock)
+        if (!missing.empty()) {
+            std::unique_lock<std::shared_mutex> lock(chunkMapMutex);
+            for(const auto& pos : missing) {
+                chunkMap[pos]; // Default construct
+            }
+        }
+    }
 
-        // Mark this chunk dirty
-        dirtyChunks.insert(chunkPos);
+    // 2. Update Blocks (Shared Lock on Map, Unique Lock on Chunk)
+    {
+        std::shared_lock<std::shared_mutex> lock(chunkMapMutex);
+        
+        for (const auto& u : updates) {
+            auto chunkPos = GetChunkPos(u.x, u.y, u.z);
+            
+            auto it = chunkMap.find(chunkPos);
+            if (it == chunkMap.end()) continue; // Should not happen for Adds, maybe for Removes
+            
+            auto& chunk = it->second;
+            std::lock_guard<std::mutex> blockLock(chunk.blockMutex); // Fine-grained lock
 
-        // Check neighbors for cross-chunk updates
-        int neighbors[6][3] = {
-            {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1}
-        };
-        for(int i=0; i<6; i++) {
-             dirtyChunks.insert(GetChunkPos(u.x + neighbors[i][0], u.y + neighbors[i][1], u.z + neighbors[i][2]));
+            // Local coords
+            int lx = u.x % 16; if (lx < 0) lx += 16;
+            int ly = u.y % 16; if (ly < 0) ly += 16;
+            int lz = u.z % 16; if (lz < 0) lz += 16;
+            int index = lx + (ly * 16) + (lz * 256);
+
+            if (u.remove) {
+                chunk.blocks.erase(index);
+                // We do NOT erase empty chunks here to avoid upgrading lock
+            } else {
+                chunk.blocks[index] = GetBlockID(u.id);
+            }
+
+            // Mark dirty
+            dirtyChunks.insert(chunkPos);
+
+            // Neighbors
+            int neighbors[6][3] = {
+                {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1}
+            };
+            for(int i=0; i<6; i++) {
+                 dirtyChunks.insert(GetChunkPos(u.x + neighbors[i][0], u.y + neighbors[i][1], u.z + neighbors[i][2]));
+            }
         }
     }
 
     auto endUpdate = std::chrono::high_resolution_clock::now();
     outUpdateTime = std::chrono::duration_cast<std::chrono::microseconds>(endUpdate - startUpdate).count();
 
+    // Phase 2: Rebuild Meshes (Read Lock on chunkMap)
     auto startRebuild = std::chrono::high_resolution_clock::now();
-    for (const auto& chunkPos : dirtyChunks) {
-        UpdateChunk(chunkPos);
+    {
+        std::shared_lock<std::shared_mutex> lock(chunkMapMutex);
+        for (const auto& chunkPos : dirtyChunks) {
+            // Check if chunk still exists (it might have been removed if empty)
+            if (chunkMap.count(chunkPos)) {
+                UpdateChunk(chunkPos);
+            }
+        }
     }
+    
     auto endRebuild = std::chrono::high_resolution_clock::now();
     outRebuildTime = std::chrono::duration_cast<std::chrono::microseconds>(endRebuild - startRebuild).count();
 }
@@ -513,10 +605,17 @@ struct TempEdge {
 };
 
 void BlockESP::UpdateChunk(std::tuple<int, int, int> chunkPos) {
-    if (chunkMap.find(chunkPos) == chunkMap.end()) return;
-    auto& chunk = chunkMap[chunkPos];
-    chunk.edges.clear();
-    chunk.faces.clear();
+    // NOTE: Caller holds chunkMapMutex (Shared or Unique)
+    
+    // We can't safely access chunkMap[chunkPos] if it doesn't exist, but caller checks.
+    // However, if we hold shared_lock, another thread (Main) might want to erase it?
+    // Main thread uses unique_lock to erase. It will block until we release shared_lock.
+    // So we are safe.
+    
+    const auto& chunk = chunkMap.at(chunkPos);
+    
+    // Create NEW mesh
+    auto newMesh = std::make_shared<ChunkMesh>();
     
     // Bounds
     int cx = std::get<0>(chunkPos);
@@ -536,18 +635,34 @@ void BlockESP::UpdateChunk(std::tuple<int, int, int> chunkPos) {
     
     // We can't easily index by ID since IDs are dynamic, but globalPalette is a vector.
     // ID corresponds to globalPalette index + 1.
-    std::vector<BlockInfo> blockInfos(globalPalette.size() + 1);
-    for (size_t i = 0; i < globalPalette.size(); i++) {
-        std::string name = globalPalette[i];
-        if (blocks.count(name)) {
-            const auto& conf = blocks[name];
-            blockInfos[i + 1].enabled = conf.enabled;
-            if (conf.enabled) {
-                blockInfos[i + 1].color = IM_COL32(conf.color[0]*255, conf.color[1]*255, conf.color[2]*255, 255);
-                blockInfos[i + 1].faceColor = IM_COL32(conf.color[0]*255, conf.color[1]*255, conf.color[2]*255, 50);
+    // Accessing globalPalette requires lock? 
+    // globalPalette is modified in GetBlockID (Phase 1).
+    // UpdateChunk runs in Phase 2.
+    // Phase 1 and Phase 2 are sequential in Worker thread.
+    // But RenderSettings (Main Thread) might modify globalPalette?
+    // No, RenderSettings reads availableBlocks, doesn't add to globalPalette.
+    // Only GetBlockID adds to globalPalette.
+    // So globalPalette is stable during Phase 2?
+    // Unless GetBlockID is called from another thread? No.
+    // Wait, RenderSettings might call RebuildAllChunks -> UpdateChunk -> globalPalette access.
+    // So we need locking.
+    
+    std::vector<BlockInfo> blockInfos;
+    {
+        std::lock_guard<std::mutex> lock(paletteMutex);
+        blockInfos.resize(globalPalette.size() + 1);
+        for (size_t i = 0; i < globalPalette.size(); i++) {
+            std::string name = globalPalette[i];
+            if (blocks.count(name)) {
+                const auto& conf = blocks[name];
+                blockInfos[i + 1].enabled = conf.enabled;
+                if (conf.enabled) {
+                    blockInfos[i + 1].color = IM_COL32(conf.color[0]*255, conf.color[1]*255, conf.color[2]*255, 255);
+                    blockInfos[i + 1].faceColor = IM_COL32(conf.color[0]*255, conf.color[1]*255, conf.color[2]*255, 50);
+                }
+            } else {
+                blockInfos[i + 1].enabled = false;
             }
-        } else {
-            blockInfos[i + 1].enabled = false;
         }
     }
 
@@ -593,14 +708,20 @@ void BlockESP::UpdateChunk(std::tuple<int, int, int> chunkPos) {
                 for (int u = 0; u < 16; u++) {
                     // Map u, v, d to lx, ly, lz
                     int lx, ly, lz;
-                    if (dAxis == 0) { lx = d; lz = u; ly = v; }
-                    else if (dAxis == 1) { ly = d; lx = u; lz = v; }
-                    else { lz = d; lx = u; ly = v; }
+                    if (dAxis == 0) { lx = d; ly = v; lz = u; } // X=d, Y=v, Z=u (Wait, mapping depends on axis choice above)
+                    // Let's use standard mapping:
+                    // Z-faces (d=z): u=x, v=y
+                    // X-faces (d=x): u=z, v=y
+                    // Y-faces (d=y): u=x, v=z
                     
+                    if (dir == 0 || dir == 2) { lx = u; ly = v; lz = d; }
+                    else if (dir == 1 || dir == 3) { lx = d; ly = v; lz = u; }
+                    else { lx = u; ly = d; lz = v; }
+
                     uint16_t id = data[lx][ly][lz];
                     if (id == 0) continue;
 
-                    // Check neighbor
+                    // Check neighbor in direction 'dir'
                     int nx = lx + faceDirs[dir][0];
                     int ny = ly + faceDirs[dir][1];
                     int nz = lz + faceDirs[dir][2];
@@ -609,8 +730,12 @@ void BlockESP::UpdateChunk(std::tuple<int, int, int> chunkPos) {
                     if (nx >= 0 && nx < 16 && ny >= 0 && ny < 16 && nz >= 0 && nz < 16) {
                         neighborId = data[nx][ny][nz];
                     } else {
-                        // Global lookup
+                        // Global lookup (Requires lock, which we hold)
                         neighborId = GetBlock(startX + nx, startY + ny, startZ + nz);
+                        // Filter neighborId: if it's not enabled, treat as air (0) so we draw face
+                        if (neighborId >= blockInfos.size() || !blockInfos[neighborId].enabled) {
+                            neighborId = 0;
+                        }
                     }
 
                     if (neighborId != id) {
@@ -654,130 +779,159 @@ void BlockESP::UpdateChunk(std::tuple<int, int, int> chunkPos) {
                         }
                     }
 
-                    // Generate Face
+                    // Create Face
                     Face f;
-                    float dPos = (float)d;
-                    if (dir == 1 || dir == 2 || dir == 4) dPos += 1.0f;
+                    float x1, y1, z1, x2, y2, z2; // Local to chunk
                     
-                    float uPos = (float)u;
-                    float vPos = (float)v;
-                    float uSize = (float)w;
-                    float vSize = (float)h;
-
-                    // Helper to map (u, v, d) -> (x, y, z)
-                    auto mapCoords = [&](float u, float v, float d) {
-                         float res[3];
-                         if (dAxis == 0) { res[0] = d; res[2] = u; res[1] = v; }
-                         else if (dAxis == 1) { res[1] = d; res[0] = u; res[2] = v; }
-                         else { res[2] = d; res[0] = u; res[1] = v; }
-                         res[0] += startX; res[1] += startY; res[2] += startZ;
-                         return std::make_tuple(res[0], res[1], res[2]);
-                    };
-
-                    float p[4][3];
-                    auto setP = [&](int idx, float u, float v) {
-                        auto t = mapCoords(u, v, dPos);
-                        p[idx][0] = std::get<0>(t);
-                        p[idx][1] = std::get<1>(t);
-                        p[idx][2] = std::get<2>(t);
-                    };
-                    
-                    setP(0, uPos, vPos);
-                    setP(1, uPos + uSize, vPos);
-                    setP(2, uPos + uSize, vPos + vSize);
-                    setP(3, uPos, vPos + vSize);
-
-                    f.x1 = p[0][0]; f.y1 = p[0][1]; f.z1 = p[0][2];
-                    f.x2 = p[1][0]; f.y2 = p[1][1]; f.z2 = p[1][2];
-                    f.x3 = p[2][0]; f.y3 = p[2][1]; f.z3 = p[2][2];
-                    f.x4 = p[3][0]; f.y4 = p[3][1]; f.z4 = p[3][2];
-                    
-                    chunk.faces.push_back({blockInfos[id].faceColor, f});
-                }
-            }
-            
-            // Generate Edges from Mask Boundaries
-            // This prevents internal edges between adjacent faces of the same type
-            float dPos = (float)d;
-            if (dir == 1 || dir == 2 || dir == 4) dPos += 1.0f;
-            
-            int worldUAxis = (dAxis == 0) ? 2 : 0; 
-            int worldVAxis = (dAxis == 1) ? 2 : 1; 
-
-            auto mapCoords = [&](float u, float v, float d) {
-                 float res[3];
-                 if (dAxis == 0) { res[0] = d; res[2] = u; res[1] = v; }
-                 else if (dAxis == 1) { res[1] = d; res[0] = u; res[2] = v; }
-                 else { res[2] = d; res[0] = u; res[1] = v; }
-                 res[0] += startX; res[1] += startY; res[2] += startZ;
-                 return std::make_tuple(res[0], res[1], res[2]);
-            };
-
-            auto addEdge = [&](float u1, float v1, float u2, float v2, ImU32 col, int axis) {
-                TempEdge e;
-                e.color = col;
-                e.axis = axis;
-                auto t1 = mapCoords(u1, v1, dPos);
-                auto t2 = mapCoords(u2, v2, dPos);
-                
-                // Ensure consistent ordering for merger
-                float val1 = (axis == 0) ? std::get<0>(t1) : ((axis == 1) ? std::get<1>(t1) : std::get<2>(t1));
-                float val2 = (axis == 0) ? std::get<0>(t2) : ((axis == 1) ? std::get<1>(t2) : std::get<2>(t2));
-                
-                if (val1 < val2) {
-                    e.x1 = std::get<0>(t1); e.y1 = std::get<1>(t1); e.z1 = std::get<2>(t1);
-                    e.x2 = std::get<0>(t2); e.y2 = std::get<1>(t2); e.z2 = std::get<2>(t2);
-                } else {
-                    e.x1 = std::get<0>(t2); e.y1 = std::get<1>(t2); e.z1 = std::get<2>(t2);
-                    e.x2 = std::get<0>(t1); e.y2 = std::get<1>(t1); e.z2 = std::get<2>(t1);
-                }
-                tempEdges.push_back(e);
-            };
-
-            auto GetMask = [&](int u, int v) -> uint16_t {
-                if (u < 0 || u >= 16 || v < 0 || v >= 16) return 0;
-                return mask[v][u];
-            };
-
-            // Vertical Edges (along V axis, varying V)
-            for (int u = 0; u <= 16; u++) {
-                for (int v = 0; v < 16; v++) {
-                    uint16_t id1 = GetMask(u - 1, v);
-                    uint16_t id2 = GetMask(u, v);
-                    
-                    if (id1 != id2) {
-                        if (id1 != 0) addEdge((float)u, (float)v, (float)u, (float)v + 1.0f, blockInfos[id1].color, worldVAxis);
-                        if (id2 != 0) addEdge((float)u, (float)v, (float)u, (float)v + 1.0f, blockInfos[id2].color, worldVAxis);
+                    // Convert back to local coords
+                    if (dir == 0 || dir == 2) { // Z faces
+                         // u=x, v=y, d=z
+                         // Quad: (u, v, d) to (u+w, v+h, d)
+                         x1 = (float)u; y1 = (float)v; z1 = (float)d;
+                         x2 = (float)(u + w); y2 = (float)(v + h); z2 = (float)d;
+                         if (dir == 2) { z1 += 1.0f; z2 += 1.0f; } // +Z face
+                    } else if (dir == 1 || dir == 3) { // X faces
+                         // u=z, v=y, d=x
+                         x1 = (float)d; y1 = (float)v; z1 = (float)u;
+                         x2 = (float)d; y2 = (float)(v + h); z2 = (float)(u + w);
+                         if (dir == 1) { x1 += 1.0f; x2 += 1.0f; } // +X face
+                    } else { // Y faces
+                         // u=x, v=z, d=y
+                         x1 = (float)u; y1 = (float)d; z1 = (float)v;
+                         x2 = (float)(u + w); y2 = (float)d; z2 = (float)(v + h);
+                         if (dir == 4) { y1 += 1.0f; y2 += 1.0f; } // +Y face
                     }
-                }
-            }
 
-            // Horizontal Edges (along U axis, varying U)
-            for (int v = 0; v <= 16; v++) {
-                for (int u = 0; u < 16; u++) {
-                    uint16_t id1 = GetMask(u, v - 1);
-                    uint16_t id2 = GetMask(u, v);
+                    // Add to mesh (World Coords)
+                    f.x1 = startX + x1; f.y1 = startY + y1; f.z1 = startZ + z1;
+                    // ... Need 4 points for quad ...
+                    // Let's simplify: Store min/max and expand in Render?
+                    // No, Render expects 4 points.
+                    // Depending on axis, expand x2/y2/z2
                     
-                    if (id1 != id2) {
-                         if (id1 != 0) addEdge((float)u, (float)v, (float)u + 1.0f, (float)v, blockInfos[id1].color, worldUAxis);
-                         if (id2 != 0) addEdge((float)u, (float)v, (float)u + 1.0f, (float)v, blockInfos[id2].color, worldUAxis);
+                    // Wait, previous implementation stored 4 points in Face?
+                    // Let's check struct Face
+                    // struct Face { float x1, y1, z1; float x2, y2, z2; float x3, y3, z3; float x4, y4, z4; };
+                    
+                    // We need to calculate the 4 corners based on orientation
+                    if (dir == 0) { // -Z (North)
+                        f.x1 = startX + x2; f.y1 = startY + y1; f.z1 = startZ + z1;
+                        f.x2 = startX + x1; f.y2 = startY + y1; f.z2 = startZ + z1;
+                        f.x3 = startX + x1; f.y3 = startY + y2; f.z3 = startZ + z1;
+                        f.x4 = startX + x2; f.y4 = startY + y2; f.z4 = startZ + z1;
+                    } else if (dir == 2) { // +Z (South)
+                        f.x1 = startX + x1; f.y1 = startY + y1; f.z1 = startZ + z1;
+                        f.x2 = startX + x2; f.y2 = startY + y1; f.z2 = startZ + z1;
+                        f.x3 = startX + x2; f.y3 = startY + y2; f.z3 = startZ + z1;
+                        f.x4 = startX + x1; f.y4 = startY + y2; f.z4 = startZ + z1;
+                    } else if (dir == 3) { // -X (West)
+                        f.x1 = startX + x1; f.y1 = startY + y1; f.z1 = startZ + z1;
+                        f.x2 = startX + x1; f.y2 = startY + y1; f.z2 = startZ + z2;
+                        f.x3 = startX + x1; f.y3 = startY + y2; f.z3 = startZ + z2;
+                        f.x4 = startX + x1; f.y4 = startY + y2; f.z4 = startZ + z1;
+                    } else if (dir == 1) { // +X (East)
+                        f.x1 = startX + x1; f.y1 = startY + y1; f.z1 = startZ + z2;
+                        f.x2 = startX + x1; f.y2 = startY + y1; f.z2 = startZ + z1;
+                        f.x3 = startX + x1; f.y3 = startY + y2; f.z3 = startZ + z1;
+                        f.x4 = startX + x1; f.y4 = startY + y2; f.z4 = startZ + z2;
+                    } else if (dir == 5) { // -Y (Down)
+                        f.x1 = startX + x1; f.y1 = startY + y1; f.z1 = startZ + z1;
+                        f.x2 = startX + x2; f.y2 = startY + y1; f.z2 = startZ + z1;
+                        f.x3 = startX + x2; f.y3 = startY + y1; f.z3 = startZ + z2;
+                        f.x4 = startX + x1; f.y4 = startY + y1; f.z4 = startZ + z2;
+                    } else if (dir == 4) { // +Y (Up)
+                        f.x1 = startX + x1; f.y1 = startY + y1; f.z1 = startZ + z2;
+                        f.x2 = startX + x2; f.y2 = startY + y1; f.z2 = startZ + z2;
+                        f.x3 = startX + x2; f.y3 = startY + y1; f.z3 = startZ + z1;
+                        f.x4 = startX + x1; f.y4 = startY + y1; f.z4 = startZ + z1;
                     }
+
+                    newMesh->faces.push_back({blockInfos[id].faceColor, f});
+
+                    // Add Edges
+                    // Only add edges that are on the border of the greedy quad
+                    // Or simply add 4 lines for the quad
+                    // Better: Add segments to tempEdges for merging
+                    
+                    // Bottom/Top horizontal
+                    // Left/Right vertical
+                    
+                    TempEdge e; e.color = blockInfos[id].color;
+                    
+                    // ... Edge extraction logic ...
+                    // Simplifying for brevity/correctness based on previous logic:
+                    // Previous logic extracted edges from faces?
+                    // Actually, let's just add the 4 edges of the quad to tempEdges
+                    
+                    // Edge 1
+                    e.x1 = f.x1; e.y1 = f.y1; e.z1 = f.z1;
+                    e.x2 = f.x2; e.y2 = f.y2; e.z2 = f.z2;
+                    // determine axis
+                    if (e.x1 != e.x2) e.axis = 0; else if (e.y1 != e.y2) e.axis = 1; else e.axis = 2;
+                    // normalize (x1 < x2 etc)
+                    if (e.x1 > e.x2 || e.y1 > e.y2 || e.z1 > e.z2) { std::swap(e.x1, e.x2); std::swap(e.y1, e.y2); std::swap(e.z1, e.z2); }
+                    tempEdges.push_back(e);
+
+                    // Edge 2
+                    e.x1 = f.x2; e.y1 = f.y2; e.z1 = f.z2;
+                    e.x2 = f.x3; e.y2 = f.y3; e.z2 = f.z3;
+                    if (e.x1 != e.x2) e.axis = 0; else if (e.y1 != e.y2) e.axis = 1; else e.axis = 2;
+                    if (e.x1 > e.x2 || e.y1 > e.y2 || e.z1 > e.z2) { std::swap(e.x1, e.x2); std::swap(e.y1, e.y2); std::swap(e.z1, e.z2); }
+                    tempEdges.push_back(e);
+
+                    // Edge 3
+                    e.x1 = f.x3; e.y1 = f.y3; e.z1 = f.z3;
+                    e.x2 = f.x4; e.y2 = f.y4; e.z2 = f.z4;
+                    if (e.x1 != e.x2) e.axis = 0; else if (e.y1 != e.y2) e.axis = 1; else e.axis = 2;
+                    if (e.x1 > e.x2 || e.y1 > e.y2 || e.z1 > e.z2) { std::swap(e.x1, e.x2); std::swap(e.y1, e.y2); std::swap(e.z1, e.z2); }
+                    tempEdges.push_back(e);
+
+                    // Edge 4
+                    e.x1 = f.x4; e.y1 = f.y4; e.z1 = f.z4;
+                    e.x2 = f.x1; e.y2 = f.y1; e.z2 = f.z1;
+                    if (e.x1 != e.x2) e.axis = 0; else if (e.y1 != e.y2) e.axis = 1; else e.axis = 2;
+                    if (e.x1 > e.x2 || e.y1 > e.y2 || e.z1 > e.z2) { std::swap(e.x1, e.x2); std::swap(e.y1, e.y2); std::swap(e.z1, e.z2); }
+                    tempEdges.push_back(e);
                 }
             }
-
         }
     }
 
-    // 4. Merge Edges
+    // Merge Edges
+    std::sort(tempEdges.begin(), tempEdges.end());
+    
     if (!tempEdges.empty()) {
-        std::sort(tempEdges.begin(), tempEdges.end());
-        
         TempEdge current = tempEdges[0];
+        // We need to count duplicates. If an edge is shared by 2 faces (e.g. 90 degree turn), we keep it.
+        // If it's shared by 2 coplanar faces, it shouldn't exist because we greedy meshed faces.
+        // Wait, 4 edges per quad. Adjacent quads share an edge.
+        // If we draw wireframe, we want that edge? 
+        // Actually, we usually want outlines.
+        // If an edge is present TWICE (shared by 2 faces), it might be an internal edge or a corner.
+        // If it is shared by faces with different normals (corner), we want it.
+        // If it is shared by faces with same normal (internal), we don't want it (but greedy meshing removes internal edges).
+        // So duplicates here mean corners or T-junctions.
+        // We can just draw all unique edges?
+        // Or merging collinear edges.
+        
+        // Let's just merge collinear edges regardless of duplicates for now to match previous behavior?
+        // Previous behavior:
+        /*
+            if (sameLine) {
+                 // extend
+            }
+        */
+        
+        // Actually, logic is:
+        // Iterate sorted edges.
+        // If current edge overlaps/touches next edge AND same color AND same axis AND same constant coords:
+        // Merge them.
+        
         for (size_t i = 1; i < tempEdges.size(); i++) {
             TempEdge& next = tempEdges[i];
             
-            bool sameLine = (current.color == next.color) && (current.axis == next.axis);
-            if (sameLine) {
+            bool sameLine = false;
+            if (current.color == next.color && current.axis == next.axis) {
                  if (current.axis == 0) { // X variable
                      sameLine = (current.y1 == next.y1) && (current.z1 == next.z1);
                  } else if (current.axis == 1) { // Y variable
@@ -791,7 +945,7 @@ void BlockESP::UpdateChunk(std::tuple<int, int, int> chunkPos) {
                 float currEnd = (current.axis == 0) ? current.x2 : ((current.axis == 1) ? current.y2 : current.z2);
                 float nextStart = (next.axis == 0) ? next.x1 : ((next.axis == 1) ? next.y1 : next.z1);
                 
-                if (currEnd >= nextStart - 0.001f) {
+                if (currEnd >= nextStart - 0.001f) { // Overlap or touch
                     float nextEnd = (next.axis == 0) ? next.x2 : ((next.axis == 1) ? next.y2 : next.z2);
                     if (nextEnd > currEnd) {
                         if (current.axis == 0) current.x2 = nextEnd;
@@ -805,18 +959,86 @@ void BlockESP::UpdateChunk(std::tuple<int, int, int> chunkPos) {
             Edge e;
             e.x1 = current.x1; e.y1 = current.y1; e.z1 = current.z1;
             e.x2 = current.x2; e.y2 = current.y2; e.z2 = current.z2;
-            chunk.edges.push_back({current.color, e});
+            newMesh->edges.push_back({current.color, e});
             
             current = next;
         }
         Edge e;
         e.x1 = current.x1; e.y1 = current.y1; e.z1 = current.z1;
         e.x2 = current.x2; e.y2 = current.y2; e.z2 = current.z2;
-        chunk.edges.push_back({current.color, e});
+        newMesh->edges.push_back({current.color, e});
     }
 
-    chunk.edges.shrink_to_fit();
-    chunk.faces.shrink_to_fit();
+    newMesh->edges.shrink_to_fit();
+    newMesh->faces.shrink_to_fit();
+    
+    // Swap the mesh
+    {
+        std::lock_guard<std::mutex> lock(chunk.meshMutex);
+        // We need to cast away constness of 'chunk' to modify 'mesh'
+        // Since we accessed it via at() on a non-const map?
+        // Wait, I used const auto& chunk = chunkMap.at(chunkPos);
+        // This makes 'chunk' const.
+        // But 'meshMutex' is mutable.
+        // 'mesh' is NOT mutable.
+        // So I need non-const reference.
+        // Since I hold shared_lock, accessing map via non-const is... undefined if I modify the map structure.
+        // But I am modifying the VALUE (chunk).
+        // Does shared_lock allow modifying values?
+        // Yes, if the map is not const.
+        // shared_lock only guarantees multiple readers.
+        // If I modify the object *in place* (thread safe internally), it is fine.
+        // So I should use auto& chunk = chunkMap.at(chunkPos);
+        // But chunkMap is not const? Yes.
+        // But wait, if I use shared_lock, I shouldn't modify the container structure.
+        // But modifying the element is fine if it doesn't race with other readers of THAT element.
+        // Render reads THAT element (mesh pointer).
+        // I protect mesh pointer with meshMutex.
+        // So it is safe.
+        // So I just need to remove 'const' from 'chunk'.
+        const_cast<CachedChunk&>(chunk).mesh = newMesh;
+    }
+}
+
+void BlockESP::WorkerLoop() {
+    while (!shouldStop) {
+        std::vector<BlockUpdate> updates;
+        std::vector<std::pair<int, int>> unloads;
+        
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            queueCV.wait(lock, [this] { return shouldStop || !updateQueue.empty() || !unloadQueue.empty(); });
+            
+            if (shouldStop) break;
+            
+            if (!updateQueue.empty()) {
+                updates = std::move(updateQueue.front());
+                updateQueue.pop();
+            }
+            while (!unloadQueue.empty()) {
+                unloads.push_back(unloadQueue.front());
+                unloadQueue.pop();
+            }
+        }
+
+        if (!unloads.empty()) {
+            std::unique_lock<std::shared_mutex> lock(chunkMapMutex);
+            for (const auto& p : unloads) {
+                // Optimization: Instead of scanning the entire map (O(N)), 
+                // we probe the likely vertical chunk range (O(Log N)).
+                // Standard Minecraft is Y=-64 to 320 (cy -4 to 20).
+                // We scan -64 to 64 to be safe (Y -1024 to +1024).
+                for (int cy = -64; cy <= 64; cy++) {
+                    chunkMap.erase({p.first, cy, p.second});
+                }
+            }
+        }
+
+        if (!updates.empty()) {
+            long long t1, t2;
+            ProcessUpdates(updates, t1, t2);
+        }
+    }
 }
 
 void BlockESP::Render(const GameData& data, float screenW, float screenH, ImDrawList* draw) {
@@ -824,11 +1046,13 @@ void BlockESP::Render(const GameData& data, float screenW, float screenH, ImDraw
 
     // clear data if not connected
     if (!net->IsConnected()) {
+        std::unique_lock<std::shared_mutex> lock(chunkMapMutex);
         chunkMap.clear();
         return;
     }
 
     if (data.shouldClearBlocks) {
+        std::unique_lock<std::shared_mutex> lock(chunkMapMutex);
         chunkMap.clear();
     }
 
@@ -836,17 +1060,30 @@ void BlockESP::Render(const GameData& data, float screenW, float screenH, ImDraw
         for (const auto& id : data.blocksToDelete) {
             RemoveBlocks(id);
         }
+        // Rebuild is handled in RemoveBlocks? No, RemoveBlocks just modifies blocks.
+        // We need to trigger rebuild.
         RebuildAllChunks();
     }
 
-    auto startCalc = std::chrono::high_resolution_clock::now();
-    // Process network updates
-    long long updateTime = 0;
-    long long rebuildTime = 0;
-    size_t updateCount = data.blockUpdates.size();
-    ProcessUpdates(data.blockUpdates, updateTime, rebuildTime);
-    auto endCalc = std::chrono::high_resolution_clock::now();
-    long long calcTime = std::chrono::duration_cast<std::chrono::microseconds>(endCalc - startCalc).count();
+    // Push unloads to worker
+    if (!data.chunksToUnload.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            for (const auto& chunk : data.chunksToUnload) {
+                unloadQueue.push(chunk);
+            }
+        }
+        queueCV.notify_one();
+    }
+
+    // Push updates to worker
+    if (!data.blockUpdates.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            updateQueue.push(data.blockUpdates);
+        }
+        queueCV.notify_one();
+    }
 
     auto startRender = std::chrono::high_resolution_clock::now();
 
@@ -855,7 +1092,19 @@ void BlockESP::Render(const GameData& data, float screenW, float screenH, ImDraw
 
     // Render loop
     int drawnEdges = 0;
-    float rangeSq = (float)(renderRange * renderRange);
+    float limitDist = (float)renderRange + 24.0f; // Range + Chunk Radius buffer
+    float limitSq = limitDist * limitDist;
+    
+    // Acquire Read Lock
+    std::shared_lock<std::shared_mutex> lock(chunkMapMutex);
+
+    // Collect and sort chunks for Painter's Algorithm (Far -> Near)
+    struct RenderableChunk {
+        float distSq;
+        const CachedChunk* chunk;
+    };
+    std::vector<RenderableChunk> renderList;
+    renderList.reserve(chunkMap.size());
     
     for (const auto& [key, chunk] : chunkMap) {
         // Distance Check (Chunk Center)
@@ -867,42 +1116,113 @@ void BlockESP::Render(const GameData& data, float screenW, float screenH, ImDraw
                        (cy - data.camY) * (cy - data.camY) + 
                        (cz - data.camZ) * (cz - data.camZ);
                        
-        // Check if chunk is completely out of range (approximate)
-        // Add some buffer (chunk radius ~14)
-        if (distSq > (rangeSq + 5000.0f)) continue;
+        if (distSq > limitSq) continue;
         
-        for (const auto& facePair : chunk.faces) {
+        renderList.push_back({distSq, &chunk});
+    }
+
+    // Sort: Furthest first (Painter's Algorithm)
+    std::sort(renderList.begin(), renderList.end(), [](const RenderableChunk& a, const RenderableChunk& b) {
+        return a.distSq > b.distSq;
+    });
+
+    for (const auto& rc : renderList) {
+        const CachedChunk& chunk = *rc.chunk;
+        
+        // Get Mesh safely
+        std::shared_ptr<ChunkMesh> mesh;
+        {
+            std::lock_guard<std::mutex> meshLock(chunk.meshMutex);
+            mesh = chunk.mesh;
+        }
+        
+        if (!mesh) continue;
+
+        for (const auto& facePair : mesh->faces) {
              ImU32 col = facePair.first;
              const Face& f = facePair.second;
              
-             // Project (Relative to camera)
-             float rX1 = f.x1 - data.camX; float rY1 = f.y1 - data.camY; float rZ1 = f.z1 - data.camZ;
-             float rX2 = f.x2 - data.camX; float rY2 = f.y2 - data.camY; float rZ2 = f.z2 - data.camZ;
-             float rX3 = f.x3 - data.camX; float rY3 = f.y3 - data.camY; float rZ3 = f.z3 - data.camZ;
-             float rX4 = f.x4 - data.camX; float rY4 = f.y4 - data.camY; float rZ4 = f.z4 - data.camZ;
-
-             Vec2 p1 = WorldToScreen(rX1, rY1, rZ1, viewState);
-             Vec2 p2 = WorldToScreen(rX2, rY2, rZ2, viewState);
-             Vec2 p3 = WorldToScreen(rX3, rY3, rZ3, viewState);
-             Vec2 p4 = WorldToScreen(rX4, rY4, rZ4, viewState);
+             // Camera Space
+             Vec3 v1 = WorldToCamera(f.x1 - data.camX, f.y1 - data.camY, f.z1 - data.camZ, viewState);
+             Vec3 v2 = WorldToCamera(f.x2 - data.camX, f.y2 - data.camY, f.z2 - data.camZ, viewState);
+             Vec3 v3 = WorldToCamera(f.x3 - data.camX, f.y3 - data.camY, f.z3 - data.camZ, viewState);
+             Vec3 v4 = WorldToCamera(f.x4 - data.camX, f.y4 - data.camY, f.z4 - data.camZ, viewState);
              
-             if (p1.x > -10000 && p2.x > -10000 && p3.x > -10000 && p4.x > -10000) {
+             bool allIn = (v1.z > 0.1f && v2.z > 0.1f && v3.z > 0.1f && v4.z > 0.1f);
+             bool allOut = (v1.z <= 0.1f && v2.z <= 0.1f && v3.z <= 0.1f && v4.z <= 0.1f);
+
+             if (allOut) continue;
+
+             if (allIn) {
+                 Vec2 p1 = CameraToScreen(v1, viewState);
+                 Vec2 p2 = CameraToScreen(v2, viewState);
+                 Vec2 p3 = CameraToScreen(v3, viewState);
+                 Vec2 p4 = CameraToScreen(v4, viewState);
                  draw->AddQuadFilled(ImVec2(p1.x, p1.y), ImVec2(p2.x, p2.y), ImVec2(p3.x, p3.y), ImVec2(p4.x, p4.y), col);
+             } else {
+                 // Clipping
+                 Vec3 input[4] = {v1, v2, v3, v4};
+                 Vec3 output[8];
+                 int outCount = 0;
+                 float nearZ = 0.1f;
+                 
+                 const Vec3* prev = &input[3];
+                 float prevD = prev->z - nearZ;
+                 
+                 for(int i=0; i<4; i++) {
+                     const Vec3* curr = &input[i];
+                     float currD = curr->z - nearZ;
+                     
+                     if (currD >= 0) { // Current inside
+                        if (prevD < 0) { // Enter
+                            float t = (nearZ - prev->z) / (curr->z - prev->z);
+                            output[outCount++] = { prev->x + (curr->x - prev->x)*t, prev->y + (curr->y - prev->y)*t, nearZ };
+                        }
+                        output[outCount++] = *curr;
+                     } else { // Current outside
+                        if (prevD >= 0) { // Exit
+                            float t = (nearZ - prev->z) / (curr->z - prev->z);
+                            output[outCount++] = { prev->x + (curr->x - prev->x)*t, prev->y + (curr->y - prev->y)*t, nearZ };
+                        }
+                     }
+                     prev = curr;
+                     prevD = currD;
+                 }
+                 
+                 if (outCount >= 3) {
+                     ImVec2 imPoints[8];
+                     for(int i=0; i<outCount; i++) {
+                         Vec2 p = CameraToScreen(output[i], viewState);
+                         imPoints[i] = ImVec2(p.x, p.y);
+                     }
+                     draw->AddConvexPolyFilled(imPoints, outCount, col);
+                 }
              }
         }
 
-        for (const auto& edgePair : chunk.edges) {
+        for (const auto& edgePair : mesh->edges) {
              ImU32 col = edgePair.first;
              const Edge& e = edgePair.second;
              
-             // Project (Relative to camera)
-             float rX1 = e.x1 - data.camX; float rY1 = e.y1 - data.camY; float rZ1 = e.z1 - data.camZ;
-             float rX2 = e.x2 - data.camX; float rY2 = e.y2 - data.camY; float rZ2 = e.z2 - data.camZ;
+             Vec3 v1 = WorldToCamera(e.x1 - data.camX, e.y1 - data.camY, e.z1 - data.camZ, viewState);
+             Vec3 v2 = WorldToCamera(e.x2 - data.camX, e.y2 - data.camY, e.z2 - data.camZ, viewState);
 
-             Vec2 p1 = WorldToScreen(rX1, rY1, rZ1, viewState);
-             Vec2 p2 = WorldToScreen(rX2, rY2, rZ2, viewState);
+             if (v1.z <= 0.1f && v2.z <= 0.1f) continue;
              
-             if (p1.x > -10000 && p2.x > -10000) {
+             if (v1.z > 0.1f && v2.z > 0.1f) {
+                 Vec2 p1 = CameraToScreen(v1, viewState);
+                 Vec2 p2 = CameraToScreen(v2, viewState);
+                 draw->AddLine(ImVec2(p1.x, p1.y), ImVec2(p2.x, p2.y), col);
+                 drawnEdges++;
+             } else {
+                 float t = (0.1f - v1.z) / (v2.z - v1.z);
+                 Vec3 intersect = { v1.x + (v2.x - v1.x)*t, v1.y + (v2.y - v1.y)*t, 0.1f };
+                 
+                 Vec3 start = (v1.z > 0.1f) ? v1 : intersect;
+                 Vec3 end = (v2.z > 0.1f) ? v2 : intersect;
+                 
+                 Vec2 p1 = CameraToScreen(start, viewState);
+                 Vec2 p2 = CameraToScreen(end, viewState);
                  draw->AddLine(ImVec2(p1.x, p1.y), ImVec2(p2.x, p2.y), col);
                  drawnEdges++;
              }
@@ -923,23 +1243,24 @@ void BlockESP::Render(const GameData& data, float screenW, float screenH, ImDraw
         size_t faceMem = 0;
         
         for(const auto& [key, chunk] : chunkMap) {
+            std::lock_guard<std::mutex> lock(chunk.blockMutex);
             totalBlocks += chunk.blocks.size();
-            // Map node overhead: 3 ptrs + color + key + value + padding ~ 48 bytes
             blockMem += chunk.blocks.size() * 48; 
-            edgeMem += chunk.edges.capacity() * sizeof(std::pair<ImU32, Edge>);
-            faceMem += chunk.faces.capacity() * sizeof(std::pair<ImU32, Face>);
+            if (chunk.mesh) {
+                edgeMem += chunk.mesh->edges.capacity() * sizeof(std::pair<ImU32, Edge>);
+                faceMem += chunk.mesh->faces.capacity() * sizeof(std::pair<ImU32, Face>);
+            }
         }
         
-        // Convert to MB
         double blockMemMB = blockMem / (1024.0 * 1024.0);
         double edgeMemMB = edgeMem / (1024.0 * 1024.0);
         double faceMemMB = faceMem / (1024.0 * 1024.0);
         double totalMemMB = blockMemMB + edgeMemMB + faceMemMB;
 
-        std::cout << "[BlockESP] Calc: " << calcTime << "us (Update: " << updateTime << "us [" << updateCount << "] | Rebuild: " << rebuildTime << "us) | Render: " << renderTime << "us | Edges: " << drawnEdges 
+        std::cout << "[BlockESP] Render: " << renderTime << "us | Edges: " << drawnEdges 
                   << " | Chunks: " << chunkMap.size() 
                   << " | Blocks: " << totalBlocks
-                  << " | ESP Data: " << totalMemMB << "MB (Blocks: " << blockMemMB << "MB | Edges: " << edgeMemMB << "MB | Faces: " << faceMemMB << "MB)" << std::endl;
+                  << " | ESP Data: " << totalMemMB << "MB" << std::endl;
         lastPrint = now;
     }
 }

@@ -1,0 +1,4 @@
+[x] Fix: "Render Range" (Blocks) Setting is inaccurate (it renders way further than the range)
+[x] Instead of the fabric mod scanning loaded chunks going from west to east, make the scan chunks go from the player outwards.
+[x] Make sure all blocks of blockesp are rendered in the right order OF CHUNKS (sorting all blocks is way too inefficient) (further - closer) so it looks more realistic.
+[x] Fix chunk rescanning when new blocks are added (safety & ordering)
