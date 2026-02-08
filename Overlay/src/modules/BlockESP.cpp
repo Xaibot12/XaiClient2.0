@@ -4,6 +4,8 @@
 #include <chrono>
 #include <set>
 #include "../stb_image.h"
+#include "../utils/DataLists.h"
+#include "../utils/IconLoader.h"
 
 namespace fs = std::filesystem;
 
@@ -112,6 +114,17 @@ bool GetAverageColor(const std::string& path, float* color) {
     return true;
 }
 
+// Helper to resolve path from prefixed icon name
+std::string ResolveIconPath(const std::string& iconValue) {
+    if (iconValue.rfind("block:", 0) == 0) {
+        return "C:/Users/Tobi/Documents/GitHub/XaiClient2.0.0/Overlay/assets/MinecraftTexturePack/assets/minecraft/textures/block/" + iconValue.substr(6) + ".png";
+    } else if (iconValue.rfind("item:", 0) == 0) {
+        return "C:/Users/Tobi/Documents/GitHub/XaiClient2.0.0/Overlay/assets/MinecraftTexturePack/assets/minecraft/textures/item/" + iconValue.substr(5) + ".png";
+    }
+    // Fallback for legacy values (assumed block)
+    return "C:/Users/Tobi/Documents/GitHub/XaiClient2.0.0/Overlay/assets/MinecraftTexturePack/assets/minecraft/textures/block/" + iconValue + ".png";
+}
+
 BlockESP::BlockESP(NetworkClient* netInstance) : Module("BlockESP", CategoryType::Render), net(netInstance) {
     LoadAvailableBlocks();
     workerThread = std::thread(&BlockESP::WorkerLoop, this);
@@ -157,36 +170,62 @@ std::string FormatName(std::string name) {
 }
 
 void BlockESP::LoadAvailableBlocks() {
-    std::string path = "C:/Users/Tobi/Documents/GitHub/XaiClient2.0.0/Overlay/assets/MinecraftTexturePack/assets/minecraft/textures/block/";
-    if (fs::exists(path)) {
-        for (const auto& entry : fs::directory_iterator(path)) {
-            if (entry.path().extension() == ".png") {
-                std::string filename = entry.path().stem().string();
-                
-                // Skip debug/meta textures
-                if (filename == "missing_tile" || filename.find("debug") != std::string::npos) continue;
-
-                std::string cleanId = StripSuffix(filename);
-                
-                if (blockIcons.find(cleanId) == blockIcons.end()) {
-                    blockIcons[cleanId] = filename;
-                    availableBlocks.push_back(cleanId);
-                } else {
-                    std::string currentIcon = blockIcons[cleanId];
-                    if (filename.length() < currentIcon.length()) {
-                         blockIcons[cleanId] = filename; 
-                    }
-                }
+    availableBlocks.clear();
+    blockIcons.clear();
+    
+    // Use DataLists and IconLoader to populate blocks
+    // Only include blocks that have a corresponding item icon (or block icon fallback)
+    for (const auto& id : DataLists::Blocks) {
+        if (IconLoader::Get().HasIcon(id)) {
+            availableBlocks.push_back(id);
+            
+            // Determine if we should treat it as item or block for color resolution
+            // IconLoader handles loading for rendering, but ResolveIconPath needs correct prefix
+            std::string itemPath = "C:/Users/Tobi/Documents/GitHub/XaiClient2.0.0/Overlay/assets/MinecraftTexturePack/assets/minecraft/textures/item/" + id + ".png";
+            
+            bool isBlock = !fs::exists(itemPath);
+            if (isBlock) {
+                 blockIcons[id] = "block:" + id;
+            } else {
+                 blockIcons[id] = "item:" + id;
             }
+        } else {
+            // Even if IconLoader.HasIcon returned false (because strict check failed previously?), 
+            // we should try to see if our heuristic finder can find it.
+            // Actually, IconLoader::Initialize only scans for exact matches in item/block folders without suffixes.
+            // We should trust IconLoader::HasIcon if we update it to support suffixes or just rely on runtime loading.
+            
+            // Wait, IconLoader::Initialize scans directory. If "grass_block_side.png" exists, it adds "grass_block_side" to availableIcons.
+            // It does NOT add "grass_block" if "grass_block.png" doesn't exist.
+            // So HasIcon("grass_block") returns false.
+            
+            // We need to force add it if we can resolve it via heuristics.
+            // Check if any heuristic match exists
+             std::vector<std::string> suffixes = { "", "_front", "_side", "_top", "_bottom", "_on", "_off" };
+             bool found = false;
+             for (const auto& suffix : suffixes) {
+                 std::string tryPath = "C:/Users/Tobi/Documents/GitHub/XaiClient2.0.0/Overlay/assets/MinecraftTexturePack/assets/minecraft/textures/block/" + id + suffix + ".png";
+                 if (fs::exists(tryPath)) {
+                     found = true;
+                     break;
+                 }
+             }
+             
+             if (found) {
+                 availableBlocks.push_back(id);
+                 blockIcons[id] = "block:" + id;
+             }
         }
     }
-    // Sort for easier searching
+    
     std::sort(availableBlocks.begin(), availableBlocks.end());
 }
 
 void BlockESP::RenderSettings() {
     ImGui::SliderInt("Render Range (Blocks)", &renderRange, 16, 512);
     ImGui::InputText("Search", searchFilter, IM_ARRAYSIZE(searchFilter));
+    ImGui::SameLine();
+    ImGui::Checkbox("Show Selected", &onlyShowSelected);
     
     if (ImGui::Button("Clear Cache")) {
         {
@@ -207,9 +246,14 @@ void BlockESP::RenderSettings() {
     std::string basePath = "C:/Users/Tobi/Documents/GitHub/XaiClient2.0.0/Overlay/assets/MinecraftTexturePack/assets/minecraft/textures/block/";
 
     for (const auto& blockId : availableBlocks) {
+        bool isEnabled = blocks[blockId].enabled;
+
+        // Filter: Show Selected
+        if (onlyShowSelected && !isEnabled) continue;
+
         std::string displayName = FormatName(blockId);
 
-        // Filter
+        // Filter: Search
         if (strlen(searchFilter) > 0) {
             std::string s = searchFilter;
             std::string b = displayName; // Search by display name
@@ -221,10 +265,15 @@ void BlockESP::RenderSettings() {
 
         ImGui::PushID(blockId.c_str());
         
-        // Icon (Use mapped texture)
-        ID3D11ShaderResourceView* tex = TextureManager::Instance().GetBlockTexture(blockIcons[blockId]);
+        // Icon (Always use IconLoader)
+        std::string iconVal = blockIcons[blockId];
+        std::string cleanId;
+        if (iconVal.rfind("item:", 0) == 0) cleanId = iconVal.substr(5);
+        else if (iconVal.rfind("block:", 0) == 0) cleanId = iconVal.substr(6);
+        else cleanId = iconVal; // Fallback
+
+        ID3D11ShaderResourceView* tex = IconLoader::Get().GetTexture(cleanId);
         
-        bool isEnabled = blocks[blockId].enabled;
         if (isEnabled) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 0.5f));
         }
@@ -238,7 +287,7 @@ void BlockESP::RenderSettings() {
                     // 1. Try hardcoded
                     if (!GetHardcodedColor(blockId, blocks[blockId].color)) {
                         // 2. Try average from icon
-                        std::string fullPath = basePath + blockIcons[blockId] + ".png";
+                        std::string fullPath = ResolveIconPath(iconVal);
                         if (!GetAverageColor(fullPath, blocks[blockId].color)) {
                              // 3. Fallback
                              blocks[blockId].color[0] = 0.0f; 

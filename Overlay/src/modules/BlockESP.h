@@ -1,7 +1,7 @@
 #pragma once
+#include "../network.h"
 #include "../Module.h"
 #include "../TextureManager.h"
-#include "../network.h"
 #include "../MathUtils.h"
 #include <map>
 #include <vector>
@@ -77,6 +77,7 @@ public:
     
     // UI State
     char searchFilter[128] = "";
+    bool onlyShowSelected = false;
     std::string editingBlock = ""; // Which block is currently being color picked
     bool showColorPicker = false;
     int renderRange = 64;

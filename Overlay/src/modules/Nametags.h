@@ -2,10 +2,12 @@
 #include "../Module.h"
 #include "../network.h"
 #include "../TextureManager.h"
+#include "Friends.h"
 #include <string>
 
 class Nametags : public Module {
 public:
+    Friends* friends = nullptr;
     bool showName = true;
     bool showPing = true;
     bool showHealth = true;
@@ -18,7 +20,7 @@ public:
     int yOffset = -20;
     int baseSize = 100; // Percent
 
-    Nametags() : Module("Nametags", CategoryType::Render) {}
+    Nametags(Friends* friendsMod = nullptr) : Module("Nametags", CategoryType::Render), friends(friendsMod) {}
 
     void RenderSettings() override {
         ImGui::Checkbox("Name", &showName);
@@ -147,10 +149,15 @@ public:
             IM_COL32(10, 10, 10, 220) 
         );
         // Add Border
+        ImU32 borderColor = IM_COL32(10, 10, 10, 255);
+        if (friends && friends->friendList.count(entity.name)) {
+            borderColor = IM_COL32(0, 255, 0, 255);
+        }
+
         draw->AddRect(
             ImVec2(screenX - textSize.x / 2 - padding, finalY - textSize.y - padding),
             ImVec2(screenX + textSize.x / 2 + padding, finalY + padding),
-            IM_COL32(10, 10, 10, 255),
+            borderColor,
             0.0f,
             0,
             1.0f // Thickness

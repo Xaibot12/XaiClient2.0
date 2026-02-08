@@ -1,30 +1,44 @@
 #pragma once
 #include "../Module.h"
+#include <map>
+#include <vector>
+#include <string>
 
-#include <sstream>
+class NetworkClient;
 
-class ESP : public Module {
+class ESP : public Module { // MobESP
 public:
-    float color[3] = { 1.0f, 0.0f, 0.0f };
+    bool showGeneric = true;
+    bool showAllEntities = false;
+    float genericColor[3] = { 1.0f, 0.0f, 0.0f }; // Red default for mobs
 
-    ESP() : Module("ESP", CategoryType::Render) {
-        enabled = true;
-    }
+    // Specific Mobs (e.g. "Zombie", "Creeper")
+    std::map<std::string, std::vector<float>> specificMobs;
+    
+    // UI State
+    char searchFilter[64] = "";
+    bool onlyShowSelected = false;
+    std::string editingMob = "";
+    bool showColorPicker = false;
+    
+    // Cache
+    std::vector<std::string> availableEntities;
+    std::map<std::string, std::string> entityIcons; // Maps ID -> Icon Path
+    bool cacheInitialized = false;
 
-    void RenderSettings() override {
-        ImGui::ColorEdit3("Color", color);
-    }
+    char inputName[64] = "";
+    float inputColor[3] = { 1.0f, 1.0f, 0.0f };
+    std::string selectedIcon = "";
 
-    void SaveConfig(std::ostream& stream) override {
-        Module::SaveConfig(stream);
-        stream << "Color=" << color[0] << " " << color[1] << " " << color[2] << "\n";
-    }
+    NetworkClient* net;
 
-    void LoadConfig(const std::map<std::string, std::string>& config) override {
-        Module::LoadConfig(config);
-        if (config.count("Color")) {
-            std::stringstream ss(config.at("Color"));
-            ss >> color[0] >> color[1] >> color[2];
-        }
-    }
+    ESP(NetworkClient* netInstance = nullptr);
+
+    void RenderSettings() override;
+    void OnToggle() override;
+    float* GetColor(const std::string& name);
+    void SaveConfig(std::ostream& stream) override;
+    void LoadConfig(const std::map<std::string, std::string>& config) override;
+
+    void SendUpdate();
 };

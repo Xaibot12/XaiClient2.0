@@ -1,9 +1,13 @@
 #pragma once
+#define NOMINMAX
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <vector>
+#include <map>
 #include <iostream>
 #include <algorithm>
+#include <chrono>
 #include <intrin.h>
 #include "Module.h"
 
@@ -16,20 +20,27 @@ struct Enchantment {
 
 struct Item {
     std::string id;
-    int count;
-    int maxDamage;
-    int damage;
+    int count = 0;
+    int maxDamage = 0;
+    int damage = 0;
     std::vector<Enchantment> enchants;
 };
 
 struct Entity {
     int id;
+    bool isPlayer;
     float x, y, z; // Relative to camera
     float w, h;
     std::string name;
     int ping;
     float health, maxHealth, absorption;
     std::vector<Item> items;
+
+    // Cache for optimization
+    bool shouldRender = false;
+    bool shouldRenderNametag = false;
+    unsigned int cachedColor = 0xFFFFFFFF;
+    int lastFrameSeen = 0;
 };
 
 struct BlockPos {
@@ -48,6 +59,7 @@ struct GameData {
     double camX, camY, camZ; // Absolute Camera Position
     float fov;
     bool isScreenOpen;
+    int targetedEntityId = -1;
     bool shouldClearBlocks = false;
     std::vector<Entity> entities;
     std::vector<BlockUpdate> blockUpdates;
@@ -55,12 +67,37 @@ struct GameData {
     std::vector<std::pair<int, int>> chunksToUnload;
 };
 
+#include "modules/ESP.h"
+#include "modules/PlayerESP.h"
+#include "modules/Nametags.h"
+
 class NetworkClient {
     SOCKET sock;
     bool connected = false;
+    
+    // Modules for Pre-Calculation
+    ESP* espModule = nullptr;
+    PlayerESP* playerEspModule = nullptr;
+    Nametags* nametagsModule = nullptr;
+
+    std::map<int, Entity> entityCache;
+    int currentFrame = 0;
+    
+    // Debugging
+    long long totalParseTime = 0;
+    int parseFrames = 0;
+    std::chrono::steady_clock::time_point lastDebugTime;
 
 public:
-    NetworkClient() : sock(INVALID_SOCKET) {}
+    NetworkClient() : sock(INVALID_SOCKET) {
+        lastDebugTime = std::chrono::steady_clock::now();
+    }
+    
+    void SetModules(ESP* esp, PlayerESP* playerEsp, Nametags* nametags) {
+        espModule = esp;
+        playerEspModule = playerEsp;
+        nametagsModule = nametags;
+    }
 
     bool IsConnected() const { return connected; }
 
@@ -152,6 +189,37 @@ public:
         return true;
     }
 
+    bool SendESPSettings(bool showGeneric, bool showAll, const std::map<std::string, std::vector<float>>& specificMobs) {
+        if (!connected) return false;
+        
+        int header = htonl(0xE581);
+        if (send(sock, (char*)&header, 4, 0) == SOCKET_ERROR) return false;
+
+        char flags[2] = { (char)(showGeneric ? 1 : 0), (char)(showAll ? 1 : 0) };
+        if (send(sock, flags, 2, 0) == SOCKET_ERROR) return false;
+
+        int count = htonl(specificMobs.size());
+        if (send(sock, (char*)&count, 4, 0) == SOCKET_ERROR) return false;
+
+        for (const auto& kv : specificMobs) {
+            std::string name = kv.first;
+            // We need to map friendly names (e.g. "Zombie") back to IDs ("zombie") if possible, 
+            // OR ensure Java side handles the names we send.
+            // The overlay uses IDs from DataLists.h for selection, but IconLoader formats them to Title Case for display?
+            // Wait, ESP.h: "strncpy(inputName, name.c_str()...)" where name is Title Case.
+            // DataLists.h has "zombie", "creeper".
+            // IconLoader converts "zombie" -> "Zombie" (Title Case).
+            // So specificMobs map keys are "Zombie", "Creeper".
+            // Java side Entity.getType().getDescription().getString() returns "Zombie", "Creeper".
+            // So sending "Zombie" is correct!
+            
+            int len = htonl(name.length());
+            if (send(sock, (char*)&len, 4, 0) == SOCKET_ERROR) return false;
+            if (send(sock, name.c_str(), name.length(), 0) == SOCKET_ERROR) return false;
+        }
+        return true;
+    }
+
     bool ReadPacket(GameData& data) {
         if (!connected) return false;
 
@@ -179,6 +247,7 @@ public:
 
             // Helpers with error checking
             bool readError = false;
+            auto tStart = std::chrono::high_resolution_clock::now();
             auto readFloat = [&](float& f) {
                 if (readError) return;
                 int i; 
@@ -239,6 +308,8 @@ public:
                 readByte(screenStatus);
                 data.isScreenOpen = (screenStatus != 0);
 
+                readInt(data.targetedEntityId);
+
                 int count;
                 readInt(count);
                 if (!readError && (count < 0 || count > 100000)) { // Sanity
@@ -248,44 +319,129 @@ public:
 
                 if (!readError) {
                     data.entities.clear();
+                    data.entities.reserve(count); // Phase 2: Reserve Space
+                    currentFrame++;
+
                     for (int i = 0; i < count; i++) {
                         if (readError) break;
-                        Entity e;
-                        readInt(e.id);
-                        readFloat(e.x);
-                        readFloat(e.y);
-                        readFloat(e.z);
-                        readFloat(e.w);
-                        readFloat(e.h);
+                        
+                        char type;
+                        readByte(type);
+                        
+                        Entity* ePtr = nullptr;
 
-                        readString(e.name);
-                        readInt(e.ping);
-                        readFloat(e.health);
-                        readFloat(e.maxHealth);
-                        readFloat(e.absorption);
+                        if (type == 0 || type == 1) { // Full Update (0=Player, 1=Mob)
+                            Entity e;
+                            e.isPlayer = (type == 0);
 
-                        for (int j = 0; j < 6; j++) {
-                            if (readError) break;
-                            Item item;
-                            readString(item.id);
-                            if (!readError && !item.id.empty()) {
-                                readInt(item.count);
-                                readInt(item.maxDamage);
-                                readInt(item.damage);
-                                int enchCount;
-                                readInt(enchCount);
-                                if (!readError && (enchCount < 0 || enchCount > 100)) { readError = true; } // Sanity
-                                
-                                for (int k = 0; k < enchCount; k++) {
-                                    if (readError) break;
-                                    Enchantment ench;
-                                    readString(ench.abbr);
-                                    readInt(ench.level);
-                                    item.enchants.push_back(ench);
+                            readInt(e.id);
+                            readFloat(e.x);
+                            readFloat(e.y);
+                            readFloat(e.z);
+                            readFloat(e.w);
+                            readFloat(e.h);
+
+                            readString(e.name);
+                            readInt(e.ping);
+                            readFloat(e.health);
+                            readFloat(e.maxHealth);
+                            readFloat(e.absorption);
+
+                            for (int j = 0; j < 6; j++) {
+                                if (readError) break;
+                                Item item;
+                                readString(item.id);
+                                if (!readError && !item.id.empty()) {
+                                    readInt(item.count);
+                                    readInt(item.maxDamage);
+                                    readInt(item.damage);
+                                    int enchCount;
+                                    readInt(enchCount);
+                                    if (!readError && (enchCount < 0 || enchCount > 100)) { readError = true; } // Sanity
+                                    
+                                    for (int k = 0; k < enchCount; k++) {
+                                        if (readError) break;
+                                        Enchantment ench;
+                                        readString(ench.abbr);
+                                        readInt(ench.level);
+                                        item.enchants.push_back(ench);
+                                    }
                                 }
+                                e.items.push_back(item);
+                            }
+                            
+                            // Update Cache
+                            entityCache[e.id] = e;
+                            ePtr = &entityCache[e.id];
+
+                        } else if (type == 2) { // Pos Only
+                            int id;
+                            readInt(id);
+                            float x, y, z;
+                            readFloat(x); readFloat(y); readFloat(z);
+
+                            if (entityCache.count(id)) {
+                                ePtr = &entityCache[id];
+                                ePtr->x = x; ePtr->y = y; ePtr->z = z;
                             }
                         }
-                        data.entities.push_back(e);
+
+                        if (ePtr) {
+                            Entity& e = *ePtr;
+                            e.lastFrameSeen = currentFrame;
+
+                            // Phase 1: Pre-Calculation of Colors & Status
+                            e.shouldRender = false;
+                            e.shouldRenderNametag = false;
+                            e.cachedColor = 0xFFFFFFFF;
+
+                            if (e.isPlayer) {
+                                if (playerEspModule && playerEspModule->enabled) {
+                                    float* col = playerEspModule->GetColor(e.name);
+                                    if (col) {
+                                        e.shouldRender = true;
+                                        e.cachedColor = IM_COL32((int)(col[0]*255), (int)(col[1]*255), (int)(col[2]*255), 255);
+                                    }
+                                }
+                                if (nametagsModule && nametagsModule->enabled) {
+                                    e.shouldRenderNametag = true;
+                                }
+                            } else {
+                                if (espModule && espModule->enabled) {
+                                    float* col = espModule->GetColor(e.name);
+                                    if (col) {
+                                        e.shouldRender = true;
+                                        e.cachedColor = IM_COL32((int)(col[0]*255), (int)(col[1]*255), (int)(col[2]*255), 255);
+                                    }
+                                }
+                            }
+
+                            data.entities.push_back(e);
+                        }
+                    }
+                    
+                    // GC: Remove old entities every 600 frames (~10s at 60fps)
+                    if (currentFrame % 600 == 0) {
+                        for (auto it = entityCache.begin(); it != entityCache.end(); ) {
+                            if (it->second.lastFrameSeen < currentFrame - 600) {
+                                it = entityCache.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    }
+
+                    auto tEnd = std::chrono::high_resolution_clock::now();
+                    totalParseTime += std::chrono::duration_cast<std::chrono::microseconds>(tEnd - tStart).count();
+                    parseFrames++;
+
+                    auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::seconds>(now - lastDebugTime).count() >= 1) {
+                        double avgParse = (totalParseTime / (double)parseFrames) / 1000.0;
+                        printf("[Perf] C++: Parse=%.2fms, Entities=%d\n", avgParse, (int)data.entities.size());
+                        lastDebugTime = now;
+                        totalParseTime = 0;
+                        parseFrames = 0;
                     }
                 }
                 

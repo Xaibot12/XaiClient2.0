@@ -8,6 +8,9 @@ set(LIBS ws2_32 d3d11 d3dcompiler dwmapi)
 
 # Source Files
 file(GLOB SOURCES "src/*.cpp")
+file(GLOB UTILS "src/utils/*.cpp")
+file(GLOB MODULES "src/modules/*.cpp")
+list(APPEND SOURCES ${UTILS} ${MODULES})
 
 # Create Executable
 add_executable(XaiOverlay ${SOURCES})

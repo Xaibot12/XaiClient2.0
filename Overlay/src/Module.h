@@ -12,6 +12,8 @@ enum class CategoryType {
     Settings
 };
 
+struct GameData;
+
 class Module {
 public:
     std::string name;
@@ -30,6 +32,8 @@ public:
     }
     
     virtual void OnToggle() {}
+
+    virtual void Update(const GameData* data) {}
     
     // Draw settings in the expanded view
     virtual void RenderSettings() {

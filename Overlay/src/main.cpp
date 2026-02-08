@@ -1,10 +1,12 @@
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
 #include <tchar.h>
 #include <dwmapi.h>
 #include <cmath>
 #include <string.h>
+#include <chrono>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -15,7 +17,9 @@
 #include "modules/ESP.h"
 #include "modules/Nametags.h"
 #include "modules/Disable.h"
-#include "modules/BlockESP.cpp"
+#include "modules/BlockESP.h"
+#include "modules/Friends.h"
+#include "modules/PlayerESP.h"
 #include "MathUtils.h"
 
 // Link DirectX
@@ -34,12 +38,24 @@ ESP* espModule = nullptr;
 Nametags* nametagsModule = nullptr;
 Disable* disableModule = nullptr;
 BlockESP* blockEspModule = nullptr;
+Friends* friendsModule = nullptr;
+PlayerESP* playerEspModule = nullptr;
 
 // Forward declarations
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
 void CleanupRenderTarget();
+
+// Performance Debugging
+long long totalRenderTime = 0;
+long long totalNametagTime = 0;
+int renderFrames = 0;
+std::chrono::steady_clock::time_point lastRenderDebugTime = std::chrono::steady_clock::now();
+
+#include "utils/IconLoader.h"
+
+// Forward declarations of helper functions
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // Math Helpers are now in MathUtils.h
@@ -112,13 +128,23 @@ int main(int, char**)
     ImGui_ImplWin32_Init(hWnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
+    // Initialize IconLoader
+    IconLoader::Get().Initialize(g_pd3dDevice);
+
     // Initialize Modules
-    espModule = new ESP();
-    nametagsModule = new Nametags();
+    friendsModule = new Friends();
+    espModule = new ESP(&net);
+    playerEspModule = new PlayerESP(friendsModule);
+    nametagsModule = new Nametags(friendsModule);
     disableModule = new Disable();
     blockEspModule = new BlockESP(&net);
 
+    // Pass Modules to Network for Pre-Calculation (Phase 1)
+    net.SetModules(espModule, playerEspModule, nametagsModule);
+
+    clickGui.RegisterModule(friendsModule);
     clickGui.RegisterModule(espModule);
+    clickGui.RegisterModule(playerEspModule);
     clickGui.RegisterModule(nametagsModule);
     clickGui.RegisterModule(disableModule);
     clickGui.RegisterModule(blockEspModule);
@@ -137,6 +163,7 @@ int main(int, char**)
     if (net.IsConnected()) {
         net.SendState(clickGui.modules);
         blockEspModule->SendUpdate(); // This triggers the block list packet
+        espModule->SendUpdate(); // Send Specific Mobs
     }
 
     // Persistent Data
@@ -192,6 +219,7 @@ int main(int, char**)
                     // Re-sync state on reconnect
                     net.SendState(clickGui.modules);
                     blockEspModule->SendUpdate();
+                    espModule->SendUpdate();
                 }
             }
         }
@@ -212,6 +240,7 @@ int main(int, char**)
 
         // Read Data (Update if available)
         net.ReadPacket(data);
+        friendsModule->Update(&data);
 
         ImDrawList* bgDrawList = ImGui::GetBackgroundDrawList();
 
@@ -227,9 +256,34 @@ int main(int, char**)
         data.shouldClearBlocks = false;
 
         // Render Entities (Hide if not focused OR screen is open)
-        if (isFocused && !data.isScreenOpen && (espModule->enabled || nametagsModule->enabled)) {
+        if (isFocused && !data.isScreenOpen && (espModule->enabled || nametagsModule->enabled || playerEspModule->enabled)) {
+            auto tRenderStart = std::chrono::high_resolution_clock::now();
+            long long frameNametagTime = 0;
+
             ImDrawList* draw = bgDrawList;
             for (const auto& e : data.entities) {
+                // Optimization Check
+                if (!e.shouldRender && !e.shouldRenderNametag) continue;
+
+                // Frustum Culling Check (Phase 3) - DISABLED for stability
+                // The simple center-point check causes entities to disappear when close or large.
+                // We will rely on WorldToScreen's clipping for now.
+                /*
+                float x = e.x; float y = e.y; float z = e.z;
+                float yawRad = data.camYaw * (3.14159f / 180.0f);
+                float cY = cos(yawRad);
+                float sY = sin(yawRad);
+                float x1 = x * cY - z * sY;
+                float z1 = x * sY + z * cY;
+                float pitchRad = data.camPitch * (3.14159f / 180.0f);
+                float cP = cos(pitchRad);
+                float sP = sin(pitchRad);
+                float z2 = y * sP + z1 * cP;
+
+                // If z2 <= 0, it's behind the camera. CULL IT!
+                if (z2 <= 0.5f) continue; // 0.5f buffer
+                */
+
                 // Calculate 3D Bounding Box Corners
                 float w2 = e.w / 2.0f;
                 float points[8][3] = {
@@ -306,23 +360,43 @@ int main(int, char**)
                             }
                         }
 
-                        if (allValid && espModule->enabled) {
-                            // Draw Quad Edges
-                            ImU32 col = IM_COL32(espModule->color[0]*255, espModule->color[1]*255, espModule->color[2]*255, 255);
-                            draw->AddLine(ImVec2(screenPoints[0].x, screenPoints[0].y), ImVec2(screenPoints[1].x, screenPoints[1].y), col);
-                            draw->AddLine(ImVec2(screenPoints[1].x, screenPoints[1].y), ImVec2(screenPoints[2].x, screenPoints[2].y), col);
-                            draw->AddLine(ImVec2(screenPoints[2].x, screenPoints[2].y), ImVec2(screenPoints[3].x, screenPoints[3].y), col);
-                            draw->AddLine(ImVec2(screenPoints[3].x, screenPoints[3].y), ImVec2(screenPoints[0].x, screenPoints[0].y), col);
-                            anyVisible = true;
+                        if (allValid) {
+                            if (e.shouldRender) {
+                                // Draw Quad Edges
+                                draw->AddLine(ImVec2(screenPoints[0].x, screenPoints[0].y), ImVec2(screenPoints[1].x, screenPoints[1].y), e.cachedColor);
+                                draw->AddLine(ImVec2(screenPoints[1].x, screenPoints[1].y), ImVec2(screenPoints[2].x, screenPoints[2].y), e.cachedColor);
+                                draw->AddLine(ImVec2(screenPoints[2].x, screenPoints[2].y), ImVec2(screenPoints[3].x, screenPoints[3].y), e.cachedColor);
+                                draw->AddLine(ImVec2(screenPoints[3].x, screenPoints[3].y), ImVec2(screenPoints[0].x, screenPoints[0].y), e.cachedColor);
+                                anyVisible = true;
+                            }
                         }
                     }
                 }
 
                 // Draw Nametags (Centered above box) - Check hasValidPoints instead of anyVisible to fix close-up culling
-                if (hasValidPoints && nametagsModule->enabled) {
+                if (hasValidPoints && nametagsModule->enabled && e.shouldRenderNametag) {
+                    auto tNametagStart = std::chrono::high_resolution_clock::now();
                     float centerX = (minX + maxX) / 2.0f;
                     nametagsModule->Render(e, centerX, minY, data.fov);
+                    auto tNametagEnd = std::chrono::high_resolution_clock::now();
+                    frameNametagTime += std::chrono::duration_cast<std::chrono::microseconds>(tNametagEnd - tNametagStart).count();
                 }
+            }
+            
+            auto tRenderEnd = std::chrono::high_resolution_clock::now();
+            totalRenderTime += std::chrono::duration_cast<std::chrono::microseconds>(tRenderEnd - tRenderStart).count();
+            totalNametagTime += frameNametagTime;
+            renderFrames++;
+
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastRenderDebugTime).count() >= 1) {
+                double avgRender = (totalRenderTime / (double)renderFrames) / 1000.0;
+                double avgNametag = (totalNametagTime / (double)renderFrames) / 1000.0;
+                printf("[Perf] C++: Render=%.2fms (Nametags=%.2fms)\n", avgRender, avgNametag);
+                lastRenderDebugTime = now;
+                totalRenderTime = 0;
+                totalNametagTime = 0;
+                renderFrames = 0;
             }
         }
 
