@@ -65,6 +65,7 @@ struct GameData {
     std::vector<BlockUpdate> blockUpdates;
     std::vector<std::string> blocksToDelete;
     std::vector<std::pair<int, int>> chunksToUnload;
+    std::vector<int> hotkeysPressed;
 };
 
 #include "modules/ESP.h"
@@ -203,19 +204,103 @@ public:
 
         for (const auto& kv : specificMobs) {
             std::string name = kv.first;
-            // We need to map friendly names (e.g. "Zombie") back to IDs ("zombie") if possible, 
-            // OR ensure Java side handles the names we send.
-            // The overlay uses IDs from DataLists.h for selection, but IconLoader formats them to Title Case for display?
-            // Wait, ESP.h: "strncpy(inputName, name.c_str()...)" where name is Title Case.
-            // DataLists.h has "zombie", "creeper".
-            // IconLoader converts "zombie" -> "Zombie" (Title Case).
-            // So specificMobs map keys are "Zombie", "Creeper".
-            // Java side Entity.getType().getDescription().getString() returns "Zombie", "Creeper".
-            // So sending "Zombie" is correct!
-            
             int len = htonl(name.length());
             if (send(sock, (char*)&len, 4, 0) == SOCKET_ERROR) return false;
             if (send(sock, name.c_str(), name.length(), 0) == SOCKET_ERROR) return false;
+        }
+        return true;
+    }
+
+    int VKToGLFW(int vk) {
+        if (vk >= '0' && vk <= '9') return vk;
+        if (vk >= 'A' && vk <= 'Z') return vk;
+        switch (vk) {
+            case VK_SPACE: return 32;
+            case VK_OEM_7: return 39; // '
+            case VK_OEM_COMMA: return 44; // ,
+            case VK_OEM_MINUS: return 45; // -
+            case VK_OEM_PERIOD: return 46; // .
+            case VK_OEM_2: return 47; // /
+            case VK_OEM_1: return 59; // ;
+            case VK_OEM_PLUS: return 61; // =
+            case VK_OEM_4: return 91; // [
+            case VK_OEM_5: return 92; // \ (backslash)
+            case VK_OEM_6: return 93; // ]
+            case VK_OEM_3: return 96; // `
+            case VK_ESCAPE: return 256;
+            case VK_RETURN: return 257;
+            case VK_TAB: return 258;
+            case VK_BACK: return 259;
+            case VK_INSERT: return 260;
+            case VK_DELETE: return 261;
+            case VK_RIGHT: return 262;
+            case VK_LEFT: return 263;
+            case VK_DOWN: return 264;
+            case VK_UP: return 265;
+            case VK_PRIOR: return 266; // PgUp
+            case VK_NEXT: return 267; // PgDn
+            case VK_HOME: return 268;
+            case VK_END: return 269;
+            case VK_CAPITAL: return 280;
+            case VK_SCROLL: return 281;
+            case VK_NUMLOCK: return 282;
+            case VK_PRINT: return 283;
+            case VK_PAUSE: return 284;
+            case VK_F1: return 290;
+            case VK_F2: return 291;
+            case VK_F3: return 292;
+            case VK_F4: return 293;
+            case VK_F5: return 294;
+            case VK_F6: return 295;
+            case VK_F7: return 296;
+            case VK_F8: return 297;
+            case VK_F9: return 298;
+            case VK_F10: return 299;
+            case VK_F11: return 300;
+            case VK_F12: return 301;
+            case VK_F13: return 302;
+            case VK_F14: return 303;
+            case VK_F15: return 304;
+            case VK_F16: return 305;
+            case VK_F17: return 306;
+            case VK_F18: return 307;
+            case VK_F19: return 308;
+            case VK_F20: return 309;
+            case VK_F21: return 310;
+            case VK_F22: return 311;
+            case VK_F23: return 312;
+            case VK_F24: return 313;
+            case VK_LSHIFT: return 340;
+            case VK_LCONTROL: return 341;
+            case VK_LMENU: return 342; // LAlt
+            case VK_LWIN: return 343;
+            case VK_RSHIFT: return 344;
+            case VK_RCONTROL: return 345;
+            case VK_RMENU: return 346; // RAlt
+            case VK_RWIN: return 347;
+            case VK_APPS: return 348;
+            default: return 0;
+        }
+    }
+
+    bool SendHotkeys(const std::vector<int>& vkKeys) {
+        if (!connected) return false;
+        
+        int header = htonl(0xB14D0);
+        if (send(sock, (char*)&header, 4, 0) == SOCKET_ERROR) return false;
+
+        std::vector<int> glfwKeys;
+        for (int vk : vkKeys) {
+            int glfw = VKToGLFW(vk);
+            if (glfw != 0) glfwKeys.push_back(glfw);
+        }
+
+        int count = htonl(glfwKeys.size());
+        if (send(sock, (char*)&count, 4, 0) == SOCKET_ERROR) return false;
+
+        for (int k : glfwKeys) {
+            int kn = htonl(k);
+            if (send(sock, (char*)&kn, 4, 0) == SOCKET_ERROR) return false;
         }
         return true;
     }
@@ -447,8 +532,7 @@ public:
                 
                 if (!readError) gotFrameUpdate = true;
 
-                } 
-                else if (header == 0xBE0C4D0) { // Block Updates
+            } else if (header == 0xBE0C4D0) { // Block Updates
                     int count;
                     readInt(count);
                     
@@ -493,6 +577,13 @@ public:
                     readInt(cz);
                     if (!readError) {
                         data.chunksToUnload.push_back({cx, cz});
+                    }
+                }
+                else if (header == 0xCB14D) { // Hotkey Pressed
+                    int key;
+                    readInt(key);
+                    if (!readError) {
+                        data.hotkeysPressed.push_back(key);
                     }
                 }
                 else {

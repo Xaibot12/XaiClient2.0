@@ -98,9 +98,11 @@ bool ClickGUI::Render() {
                                         if (i == VK_ESCAPE) {
                                             mod->keybind = 0;
                                             mod->isBinding = false;
+                                            changed = true;
                                         } else {
                                             mod->keybind = i;
                                             mod->isBinding = false;
+                                            changed = true;
                                         }
                                         break; // Only handle one key
                                     }

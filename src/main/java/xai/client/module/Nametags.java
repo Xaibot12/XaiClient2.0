@@ -1,5 +1,6 @@
 package xai.client.module;
 
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.entity.EquipmentSlot;
@@ -58,30 +59,30 @@ public class Nametags {
         Map.entry("swift_sneak", "SN")
     );
 
-    public static void writeData(DataOutputStream out, Player player, Minecraft client) throws IOException {
-        String name = player.getName().getString();
+    public static void writeData(DataOutputStream out, LivingEntity entity, Minecraft client) throws IOException {
+        String name = entity.getName().getString();
         byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
         out.writeInt(nameBytes.length);
         out.write(nameBytes);
 
         int ping = -1;
-        if (client.getConnection() != null) {
-            PlayerInfo info = client.getConnection().getPlayerInfo(player.getUUID());
+        if (entity instanceof Player && client.getConnection() != null) {
+            PlayerInfo info = client.getConnection().getPlayerInfo(entity.getUUID());
             if (info != null) ping = info.getLatency();
         }
         out.writeInt(ping);
 
-        out.writeFloat(player.getHealth());
-        out.writeFloat(player.getMaxHealth());
-        out.writeFloat(player.getAbsorptionAmount());
+        out.writeFloat(entity.getHealth());
+        out.writeFloat(entity.getMaxHealth());
+        out.writeFloat(entity.getAbsorptionAmount());
 
         ItemStack[] items = new ItemStack[] {
-            player.getMainHandItem(),
-            player.getOffhandItem(),
-            player.getItemBySlot(EquipmentSlot.HEAD),
-            player.getItemBySlot(EquipmentSlot.CHEST),
-            player.getItemBySlot(EquipmentSlot.LEGS),
-            player.getItemBySlot(EquipmentSlot.FEET)
+            entity.getMainHandItem(),
+            entity.getOffhandItem(),
+            entity.getItemBySlot(EquipmentSlot.HEAD),
+            entity.getItemBySlot(EquipmentSlot.CHEST),
+            entity.getItemBySlot(EquipmentSlot.LEGS),
+            entity.getItemBySlot(EquipmentSlot.FEET)
         };
 
         for (ItemStack stack : items) {

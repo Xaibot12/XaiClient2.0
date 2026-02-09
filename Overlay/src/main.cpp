@@ -159,11 +159,21 @@ int main(int, char**)
     // Load Config
     clickGui.LoadConfig("config.ini");
     
+    // Helper to send hotkeys
+    auto BroadcastHotkeys = [&]() {
+        std::vector<int> keys;
+        for (auto mod : clickGui.modules) {
+            if (mod->keybind > 0) keys.push_back(mod->keybind);
+        }
+        net.SendHotkeys(keys);
+    };
+
     // Now that config is loaded (and BlockESP has its list), send the update if connected
     if (net.IsConnected()) {
         net.SendState(clickGui.modules);
         blockEspModule->SendUpdate(); // This triggers the block list packet
         espModule->SendUpdate(); // Send Specific Mobs
+        BroadcastHotkeys();
     }
 
     // Persistent Data
@@ -197,14 +207,19 @@ int main(int, char**)
             SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
 
-        // Module Keybinds
-        for (auto mod : clickGui.modules) {
-            if (mod->keybind > 0 && !mod->isBinding) {
-                if (GetAsyncKeyState(mod->keybind) & 1) {
-                    mod->Toggle();
+        // Module Keybinds (Network Driven)
+        for (int pressedKey : data.hotkeysPressed) {
+            for (auto mod : clickGui.modules) {
+                if (mod->keybind > 0 && !mod->isBinding) {
+                    // Convert Module VK to GLFW to match Packet
+                    int glfwKey = net.VKToGLFW(mod->keybind);
+                    if (glfwKey == pressedKey) {
+                        mod->Toggle();
+                    }
                 }
             }
         }
+        data.hotkeysPressed.clear(); // Consume keys
 
         // Find Minecraft Window
         static HWND mcHwnd = NULL;
@@ -409,6 +424,7 @@ int main(int, char**)
                     done = true; // Exit loop
                 } else {
                     net.SendState(clickGui.modules);
+                    BroadcastHotkeys();
                 }
             }
         }
